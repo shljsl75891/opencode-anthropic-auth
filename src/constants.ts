@@ -21,6 +21,14 @@ export const OAUTH_SCOPES = [
 
 export const TOOL_PREFIX = 'mcp_'
 
+/**
+ * Anthropic's sliding-window lookback for cache breakpoints.
+ * If the distance (in content blocks) between the previous user-role
+ * message anchor and the latest one exceeds this threshold, a bridge
+ * anchor is needed so the earlier slots are still within the window.
+ */
+export const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
+
 export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',

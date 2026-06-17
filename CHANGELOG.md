@@ -1,5 +1,24 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.1.0
+
+### Minor Changes
+
+- Improved hybrid 1h prompt-caching breakpoint placement (ported from cortexkit/anthropic-auth):
+  - **Rolling latest anchor**: cache breakpoint now placed on the most recent user message beyond
+    `messages[1]`, keeping cache hot across long multi-turn sessions.
+  - **Bridge anchor**: when the cumulative block distance between the previous and latest user
+    anchors exceeds Anthropic's 20-block lookback window, an additional bridge breakpoint is
+    inserted at the previous user boundary so all anchors stay within the sliding window.
+  - **Magic-context split**: when `messages[0]` contains two or more cacheable blocks (stable
+    prefix merged with volatile delta), the first and second blocks are anchored instead of the
+    last block, preventing the volatile tail from busting the cache on every turn.
+  - **Thinking/redacted_thinking guard**: thinking and redacted_thinking blocks are excluded from
+    cache anchor placement; a message whose content is entirely thinking blocks is skipped entirely
+    (avoids Anthropic 400 `"Extra inputs are not permitted"` on `cache_control`).
+  - **Trailing assistant strip**: assistant-role messages at the tail of the request are removed
+    before caching and forwarding; OAuth endpoints reject assistant prefill.
+
 ## 1.8.1
 
 ### Patch Changes

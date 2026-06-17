@@ -1,4 +1,5 @@
 import {
+  ANTHROPIC_CACHE_LOOKBACK_BLOCKS,
   CLAUDE_CODE_IDENTITY,
   OPENCODE_IDENTITY_PREFIX,
   PARAGRAPH_REMOVAL_ANCHORS,
@@ -277,6 +278,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const CACHE_1H = { type: 'ephemeral', ttl: '1h' } as const
 
+// ---------------------------------------------------------------------------
+// Cache control primitives
+// ---------------------------------------------------------------------------
+
 function removeCacheControl(value: unknown): void {
   if (!isRecord(value)) return
   delete value.cache_control
@@ -303,38 +308,240 @@ function setWireCacheControl(value: unknown): boolean {
   return true
 }
 
-function setMessageCacheAnchor(message: unknown): boolean {
-  if (!isRecord(message)) return false
-  const content = Array.isArray(message.content)
-    ? message.content
-    : typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : null
-  if (!content?.length) return setWireCacheControl(message)
-  message.content = content
-  const target = [...content]
-    .reverse()
-    .find((b) => isRecord(b) && b.type !== 'thinking')
-  return setWireCacheControl(target ?? message)
+// ---------------------------------------------------------------------------
+// Content-block helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true for content block types that accept cache_control.
+ * Anthropic rejects cache_control on thinking / redacted_thinking blocks.
+ */
+function isCacheableContentBlock(block: unknown): block is Record<string, unknown> {
+  if (!isRecord(block)) return false
+  return block.type !== 'thinking' && block.type !== 'redacted_thinking'
 }
 
+/**
+ * Normalises message content to an array of blocks, then filters to only
+ * cacheable types.  Returns undefined when there is nothing to anchor.
+ */
+function getCacheableContentBlocks(
+  message: unknown,
+): Record<string, unknown>[] | undefined {
+  if (!isRecord(message)) return undefined
+
+  let blocks: unknown[]
+  if (Array.isArray(message.content)) {
+    blocks = message.content
+  } else if (typeof message.content === 'string') {
+    // Normalise inline string to block array in place so downstream sees array
+    const normalised = [{ type: 'text', text: message.content }]
+    message.content = normalised
+    blocks = normalised
+  } else {
+    return undefined
+  }
+
+  const cacheable = blocks.filter(isCacheableContentBlock)
+  return cacheable.length > 0 ? cacheable : undefined
+}
+
+/**
+ * Total cacheable content-block count for a message (used for lookback math).
+ */
+function messageContentBlockCount(message: unknown): number {
+  return getCacheableContentBlocks(message)?.length ?? 0
+}
+
+// ---------------------------------------------------------------------------
+// Message-anchor setters
+// ---------------------------------------------------------------------------
+
+/**
+ * Anchor the last cacheable block of a message.
+ * Returns false (and sets nothing) when there are no cacheable blocks.
+ */
+function setMessageCacheAnchor(message: unknown): boolean {
+  const blocks = getCacheableContentBlocks(message)
+  if (!blocks) return false
+  return setWireCacheControl(blocks[blocks.length - 1])
+}
+
+/**
+ * Anchor the FIRST cacheable block of a message (for magic-context split).
+ */
+function setFirstMessageCacheAnchor(message: unknown): boolean {
+  const blocks = getCacheableContentBlocks(message)
+  if (!blocks) return false
+  return setWireCacheControl(blocks[0])
+}
+
+/**
+ * Anchor the SECOND cacheable block of a message (for magic-context split).
+ * Returns false when fewer than two cacheable blocks exist.
+ */
+function setSecondMessageCacheAnchor(message: unknown): boolean {
+  const blocks = getCacheableContentBlocks(message)
+  if (!blocks || blocks.length < 2) return false
+  return setWireCacheControl(blocks[1])
+}
+
+// ---------------------------------------------------------------------------
+// Rolling-anchor selection
+// ---------------------------------------------------------------------------
+
+type MessageAnchorPosition = {
+  /** Index into messages array */
+  index: number
+  /** Number of cacheable blocks in this message (for lookback accounting) */
+  blockCount: number
+}
+
+type HybridMessageAnchors = {
+  /** Latest user/tool-result message beyond index 1 */
+  latest: MessageAnchorPosition | undefined
+  /** Previous user/tool-result when distance to latest > lookback window */
+  bridge: MessageAnchorPosition | undefined
+}
+
+/**
+ * Walk all messages and collect user-role (or tool_result) anchor positions.
+ * Returns the `latest` position (index > 1) and a `bridge` position placed
+ * whenever the cumulative block distance from bridge→latest exceeds
+ * ANTHROPIC_CACHE_LOOKBACK_BLOCKS, ensuring both are within the sliding window.
+ */
+function selectHybridMessageAnchors(
+  messages: unknown[],
+): HybridMessageAnchors {
+  // Collect positions of user-role messages that have cacheable content
+  const userPositions: MessageAnchorPosition[] = messages
+    .map((msg, index) => {
+      if (!isRecord(msg)) return null
+      if (msg.role !== 'user') return null
+      const blockCount = messageContentBlockCount(msg)
+      if (blockCount === 0) return null
+      return { index, blockCount }
+    })
+    .filter((p): p is MessageAnchorPosition => p !== null)
+
+  // We only care about positions beyond index 1 (0 and 1 are always anchored)
+  const rollingPositions = userPositions.filter((p) => p.index > 1)
+  if (rollingPositions.length === 0) {
+    return { latest: undefined, bridge: undefined }
+  }
+
+  // Non-null: rollingPositions is non-empty (early return guards above)
+  // biome-ignore lint/style/noNonNullAssertion: guarded by length check above
+  const latest = rollingPositions[rollingPositions.length - 1]!
+
+  // Find a bridge: walk back from latest until cumulative blocks exceed window
+  let bridge: MessageAnchorPosition | undefined
+  let cumulativeBlocks = latest.blockCount
+  for (let i = rollingPositions.length - 2; i >= 0; i--) {
+    // biome-ignore lint/style/noNonNullAssertion: index is within bounds
+    cumulativeBlocks += rollingPositions[i]!.blockCount
+    if (cumulativeBlocks > ANTHROPIC_CACHE_LOOKBACK_BLOCKS) {
+      bridge = rollingPositions[i]
+      break
+    }
+  }
+
+  return { latest, bridge }
+}
+
+// ---------------------------------------------------------------------------
+// System-anchor setter
+// ---------------------------------------------------------------------------
+
+/**
+ * Place a cache anchor on the last system block that follows the
+ * CLAUDE_CODE_IDENTITY block.  When there are no system blocks, or all
+ * system blocks precede the identity, nothing is anchored.
+ */
+function setHybridSystemAnchor(parsed: Record<string, unknown>): void {
+  if (!Array.isArray(parsed.system)) return
+
+  const identityIdx = parsed.system.findIndex(
+    (b) => isRecord(b) && b.text === CLAUDE_CODE_IDENTITY,
+  )
+  const afterIdentity = parsed.system
+    .slice(identityIdx >= 0 ? identityIdx + 1 : 0)
+    .filter(isRecord)
+
+  setWireCacheControl(afterIdentity[afterIdentity.length - 1])
+}
+
+// ---------------------------------------------------------------------------
+// Trailing-assistant strip (Tier 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove trailing assistant-role messages.  OAuth endpoints reject requests
+ * that end with an assistant turn (assistant prefill is not supported).
+ */
+function stripTrailingAssistantMessages(
+  parsed: Record<string, unknown>,
+): void {
+  if (!Array.isArray(parsed.messages)) return
+  while (
+    parsed.messages.length > 0 &&
+    isRecord(parsed.messages[parsed.messages.length - 1]) &&
+    parsed.messages[parsed.messages.length - 1].role === 'assistant'
+  ) {
+    parsed.messages.pop()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main hybrid cache logic
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply hybrid 1h prompt-caching breakpoints to parsed request body.
+ *
+ * Breakpoint slots (Anthropic supports max 4 per request):
+ *   1. Last system block after the identity block  (skipped when bridge used)
+ *   2. messages[0] — first cacheable block         (magic-context: slot 2a)
+ *   3. messages[0] — second cacheable block        (magic-context split only)
+ *      OR messages[1] last cacheable block         (normal path)
+ *      OR bridge user message                      (when bridge detected)
+ *   4. Latest user/tool-result message (index > 1) (when present)
+ */
 function applyHybridCache1h(parsed: Record<string, unknown>): void {
   removeAllCacheControls(parsed)
 
-  // Cache last system block after the identity block
-  if (Array.isArray(parsed.system)) {
-    const identityIdx = parsed.system.findIndex(
-      (b) => isRecord(b) && b.text === CLAUDE_CODE_IDENTITY,
-    )
-    const cacheableSystem = parsed.system
-      .slice(identityIdx >= 0 ? identityIdx + 1 : 0)
-      .filter(isRecord)
-    setWireCacheControl(cacheableSystem[cacheableSystem.length - 1])
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+  const { latest, bridge } = selectHybridMessageAnchors(messages)
+
+  // --- Slot 1: system anchor (skip when bridge will occupy a slot) ---
+  if (!bridge) {
+    setHybridSystemAnchor(parsed)
   }
 
-  if (!Array.isArray(parsed.messages)) return
-  setMessageCacheAnchor(parsed.messages[0])
-  setMessageCacheAnchor(parsed.messages[1])
+  // --- Slots 2 & 3: messages[0] ---
+  const msg0 = messages[0]
+  const msg0Blocks = getCacheableContentBlocks(msg0)
+  if (msg0Blocks && msg0Blocks.length >= 2) {
+    // Magic-context split: stable prefix is in block[0] and block[1];
+    // anchoring last block would bust cache every turn.
+    setFirstMessageCacheAnchor(msg0)
+    setSecondMessageCacheAnchor(msg0)
+  } else {
+    setMessageCacheAnchor(msg0)
+
+    // --- Slot 3 (normal): messages[1] or bridge ---
+    if (bridge) {
+      setHybridSystemAnchor(parsed) // system anchor reclaimed for bridge support
+      setMessageCacheAnchor(messages[bridge.index])
+    } else {
+      setMessageCacheAnchor(messages[1])
+    }
+  }
+
+  // --- Slot 4: rolling latest user anchor ---
+  if (latest) {
+    setMessageCacheAnchor(messages[latest.index])
+  }
 }
 
 /**
@@ -399,6 +606,7 @@ export function rewriteRequestBody(body: string): string {
   try {
     const parsed = JSON.parse(body)
     parsed.system = prependClaudeCodeIdentity(parsed.system)
+    stripTrailingAssistantMessages(parsed)
     applyHybridCache1h(parsed)
     return prefixToolNames(parsed)
   } catch {
