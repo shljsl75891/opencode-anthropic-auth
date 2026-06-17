@@ -351,53 +351,68 @@ function setSecondMessageCacheAnchor(message: unknown): boolean {
   return setWireCacheControl(blocks[1])
 }
 
-type MessageAnchorPosition = {
-  index: number
-  blockCount: number
-}
-
 type HybridMessageAnchors = {
-  latest: MessageAnchorPosition | undefined
-  bridge: MessageAnchorPosition | undefined
+  latest: number | undefined
+  bridge: number | undefined
 }
 
 /**
- * Walk all messages and collect user-role anchor positions.
- * Returns the `latest` position (index > 1) and a `bridge` position placed
- * whenever the cumulative block distance from bridge→latest exceeds
- * ANTHROPIC_CACHE_LOOKBACK_BLOCKS, ensuring both are within the sliding window.
+ * Total positional block count for a message regardless of role or type.
+ * Anthropic's cache lookback window counts every content block (text,
+ * thinking, tool_use, tool_result, …), so distance math must use raw counts,
+ * not the cacheable-only filter used to validate anchor placement.
+ */
+function rawBlockCount(message: unknown): number {
+  if (!isRecord(message)) return 0
+  const { content } = message
+  if (Array.isArray(content)) return content.length
+  if (typeof content === 'string') return 1
+  return 0
+}
+
+/**
+ * Collect user-role anchor indices that hold at least one cacheable block,
+ * then pick the `latest` (index > 1) and a `bridge`. The bridge is the
+ * furthest-back valid user anchor where the block count between it and
+ * `latest` — counting ALL content blocks across user and assistant turns,
+ * excluding the anchor's own blocks — does not exceed
+ * ANTHROPIC_CACHE_LOOKBACK_BLOCKS. This keeps the older breakpoint inside
+ * Anthropic's sliding lookback window so the cached prefix stays reachable.
  */
 function selectHybridMessageAnchors(messages: unknown[]): HybridMessageAnchors {
-  const userPositions: MessageAnchorPosition[] = messages
-    .map((msg, index) => {
-      if (!isRecord(msg)) return null
-      if (msg.role !== 'user') return null
-      const blockCount = messageContentBlockCount(msg)
-      if (blockCount === 0) return null
-      return { index, blockCount }
-    })
-    .filter((p): p is MessageAnchorPosition => p !== null)
+  // Collect indices of user messages beyond index 1 that have ≥1 cacheable block.
+  // Indices 0 and 1 are handled as fixed slots in applyHybridCache1h, not rolling.
+  const rollingIndices: number[] = []
+  messages.forEach((msg, index) => {
+    if (
+      index > 1 &&
+      isRecord(msg) &&
+      msg.role === 'user' &&
+      messageContentBlockCount(msg) > 0
+    ) {
+      rollingIndices.push(index)
+    }
+  })
 
-  const rollingPositions = userPositions.filter((p) => p.index > 1)
-  if (rollingPositions.length === 0) {
+  if (rollingIndices.length === 0) {
     return { latest: undefined, bridge: undefined }
   }
 
   // biome-ignore lint/style/noNonNullAssertion: guarded by length check above
-  const latest = rollingPositions[rollingPositions.length - 1]!
+  const latestIndex = rollingIndices[rollingIndices.length - 1]!
+  const rollingSet = new Set(rollingIndices)
 
-  let bridge: MessageAnchorPosition | undefined
-  let cumulativeBlocks = latest.blockCount
-  for (let i = rollingPositions.length - 2; i >= 0; i--) {
-    // biome-ignore lint/style/noNonNullAssertion: index is within bounds
-    cumulativeBlocks += rollingPositions[i]!.blockCount
-    if (cumulativeBlocks > ANTHROPIC_CACHE_LOOKBACK_BLOCKS) {
-      bridge = rollingPositions[i]
-      break
+  let bridge: number | undefined
+  let cumulativeBlocks = 0
+  for (let i = latestIndex - 1; i >= 0; i--) {
+    if (rollingSet.has(i)) {
+      if (cumulativeBlocks > ANTHROPIC_CACHE_LOOKBACK_BLOCKS) break
+      bridge = i
     }
+    cumulativeBlocks += rawBlockCount(messages[i])
   }
 
-  return { latest, bridge }
+  return { latest: latestIndex, bridge }
 }
 
 function systemBlockText(block: unknown): string {
@@ -520,7 +535,7 @@ function applyHybridCache1h(parsed: Record<string, unknown>): void {
   const messages = Array.isArray(parsed.messages) ? parsed.messages : []
   const { latest, bridge } = selectHybridMessageAnchors(messages)
 
-  if (!bridge) {
+  if (bridge === undefined) {
     setHybridSystemAnchor(parsed)
   }
 
@@ -531,17 +546,17 @@ function applyHybridCache1h(parsed: Record<string, unknown>): void {
     setSecondMessageCacheAnchor(msg0)
   } else {
     setMessageCacheAnchor(msg0)
-    if (!bridge) {
+    if (bridge === undefined) {
       setMessageCacheAnchor(messages[1])
     }
   }
 
-  if (bridge) {
-    setMessageCacheAnchor(messages[bridge.index])
+  if (bridge !== undefined) {
+    setMessageCacheAnchor(messages[bridge])
   }
 
-  if (latest) {
-    setMessageCacheAnchor(messages[latest.index])
+  if (latest !== undefined) {
+    setMessageCacheAnchor(messages[latest])
   }
 }
 

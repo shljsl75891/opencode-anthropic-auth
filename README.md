@@ -33,7 +33,7 @@ This fork applies **hybrid 1-hour ephemeral prompt caching** on every request, p
 |---|---|
 | **System anchor** | Last system block after the identity block (skipped when bridge occupies the slot) |
 | **messages[0]** | Magic-context split: anchors block[0] + block[1] when stable prefix and volatile delta are merged; otherwise anchors the last cacheable block |
-| **messages[1] / bridge** | Last cacheable block of messages[1]; replaced by a bridge anchor when a tool-heavy session pushes the latest user boundary outside Anthropic's 20-block lookback window |
+| **messages[1] / bridge** | Last cacheable block of messages[1]; replaced by a bridge anchor when the block count between two user anchors (counting ALL block types across every role) exceeds Anthropic's 20-block lookback window |
 | **Rolling latest** | Most recent user message beyond index 1, keeping cache hot across long sessions |
 
 Additional behaviours:

@@ -777,6 +777,25 @@ describe('rewriteRequestBody', () => {
     expect(result.system[2].text).toBe('Second block\nThird block')
     expect(result.messages[0].content[0].text).toBe('hi')
   })
+
+  test('preserves client context_management field untouched', () => {
+    const contextManagement = {
+      edits: [
+        {
+          type: 'clear_tool_uses_20250919',
+          trigger: { input_tokens: 40000 },
+          keep: { tool_uses: 5 },
+        },
+      ],
+    }
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hi' }],
+      context_management: contextManagement,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.context_management).toEqual(contextManagement)
+  })
 })
 
 import { REALISTIC_SYSTEM_PROMPT } from './fixtures/realistic-system-prompt'
@@ -1157,6 +1176,167 @@ describe('hybrid cache – breakpoint placement', () => {
       ),
     )
     expect(result.messages[0].content[0].cache_control).toBeUndefined()
+    expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('tool_result-only user message is anchored on its last block', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'run the tool'),
+            makeMsg('assistant', [
+              { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
+            ]),
+            makeMsg('user', [
+              {
+                type: 'tool_result',
+                tool_use_id: 't1',
+                content: 'output line 1',
+              },
+              {
+                type: 'tool_result',
+                tool_use_id: 't2',
+                content: 'output line 2',
+              },
+            ]),
+          ],
+        }),
+      ),
+    )
+    const content = result.messages[2].content
+    expect(content[content.length - 1].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('bridge fires when assistant turns push positional distance past lookback', () => {
+    // Layout: [user m0, user m1, (assistant×5, user)×6]
+    // Rolling user indices: 3,5,7,9,11,13. latestIndex=13.
+    // Walking back from 13: cum reaches 23 at i=6 (5 blocks) with lastAnchor=7.
+    // Bridge lands at index 7; indices 3,5,9,11 are not anchored.
+    const messages: unknown[] = [makeMsg('user', 'm0'), makeMsg('user', 'm1')]
+    for (let i = 0; i < 6; i++) {
+      messages.push(
+        makeMsg('assistant', [
+          textBlock('a1'),
+          textBlock('a2'),
+          textBlock('a3'),
+          textBlock('a4'),
+          textBlock('a5'),
+        ]),
+      )
+      messages.push(makeMsg('user', `q${i}`))
+    }
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const latestContent = result.messages[13].content
+    expect(latestContent[latestContent.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    const bridgeContent = result.messages[7].content
+    expect(bridgeContent[bridgeContent.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    for (const idx of [3, 5, 9, 11]) {
+      const msg = result.messages[idx] as Record<string, unknown>
+      const content = Array.isArray(msg.content) ? msg.content : []
+      const anchored = (content as Array<Record<string, unknown>>).some(
+        (b) => b.cache_control != null,
+      )
+      expect(anchored).toBe(false)
+    }
+  })
+
+  test('bridge not placed when no valid user anchor exists before overflow', () => {
+    // messages[2] is the only rolling anchor between m1 and latest, but a
+    // 25-block assistant turn separates them — overflow fires before any anchor
+    // is set, so bridge=undefined and messages[1] takes the normal slot-3 anchor.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'mid'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 25 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // bridge=undefined → messages[1] anchored in the normal msg[1] slot
+    const msg1 = result.messages[1]
+    expect(Array.isArray(msg1.content)).toBe(true)
+    expect(msg1.content[msg1.content.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    // 'mid' (index 2) carries no bridge anchor
+    const midContent = Array.isArray(result.messages[2].content)
+      ? (result.messages[2].content as Array<Record<string, unknown>>)
+      : []
+    expect(midContent.some((b) => b.cache_control != null)).toBe(false)
+  })
+
+  test('bridge placed when block distance equals lookback threshold', () => {
+    // Exactly 20 blocks between bridge candidate (index 2) and latest (index 4).
+    // cumBlocks at anchor check = 20, which is not > 20, so bridge IS placed.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'bridge-candidate'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 20 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const bridgeContent = result.messages[2].content
+    expect(
+      (bridgeContent as Array<Record<string, unknown>>).some(
+        (b) => b.cache_control != null,
+      ),
+    ).toBe(true)
+  })
+
+  test('bridge not placed when block distance exceeds lookback threshold by one', () => {
+    // 21 blocks between bridge candidate (index 2) and latest (index 4).
+    // cumBlocks at anchor check = 21 > 20 → bridge=undefined.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'bridge-candidate'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 21 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // bridge=undefined → messages[1] takes the normal msg[1] slot
+    const msg1 = result.messages[1]
+    expect(Array.isArray(msg1.content)).toBe(true)
+    expect(msg1.content[msg1.content.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+  })
+
+  test('no bridge when only one rolling anchor exists (latestIndex === 2)', () => {
+    // Only messages[2] qualifies as a rolling anchor (index > 1).
+    // The loop has no valid bridge candidate → bridge=undefined.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // latest at index 2 is anchored
+    expect(result.messages[2].content[0].cache_control).toEqual(CACHE_1H)
+    // bridge=undefined → messages[1] anchored in the normal msg[1] slot
     expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
   })
 })

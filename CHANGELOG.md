@@ -1,5 +1,31 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.3.0
+
+### Patch Changes
+
+- **Bridge-anchor distance correctness**: `selectHybridMessageAnchors` previously
+  measured the 20-block lookback distance by summing only cacheable blocks from
+  user-role messages, silently ignoring assistant turns (text, tool_use) and thinking
+  blocks. Anthropic's lookback window counts every positional content block regardless
+  of role or type. The new `rawBlockCount` helper counts all blocks, and the bridge
+  selection loop now walks the full message array — so the bridge fires correctly in
+  tool-heavy and thinking-heavy sessions instead of too late or not at all. The
+  algorithm now also directly measures the block count between the bridge candidate
+  and `latest` (excluding the anchor's own blocks), matching the invariant described
+  in the JSDoc. The `MessageAnchorPosition` wrapper type was removed; anchor indices
+  are now plain `number | undefined`.
+- **Bridge placement tests**: tightened existing bridge test to pin the exact bridge
+  index (7); added boundary tests at 20 blocks (bridge placed) and 21 blocks (bridge
+  absent); added test confirming no bridge is placed when no valid user anchor exists
+  before the overflow point; added `latestIndex === 2` regression test (single rolling
+  candidate, no room for bridge).
+- **`tool_result` anchor regression test**: verified that a user message containing
+  only `tool_result` blocks is correctly selected as a rolling anchor.
+- **`context_management` passthrough regression test**: verified that
+  `rewriteRequestBody` preserves a client-supplied `context_management` body field
+  (e.g. `context-management-2025-06-27` server-side tool-result clearing) untouched.
+
 ## 2.2.0
 
 ### Minor Changes
