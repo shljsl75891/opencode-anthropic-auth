@@ -453,6 +453,55 @@ function selectHybridMessageAnchors(
 // System-anchor setter
 // ---------------------------------------------------------------------------
 
+function systemBlockText(block: unknown): string {
+  return isRecord(block) && typeof block.text === 'string' ? block.text : ''
+}
+
+/**
+ * Merge all plugin-added system instruction blocks (those after the primary
+ * OpenCode/system prompt block) into a single block before placing the hybrid
+ * system cache anchor.
+ *
+ * OpenCode normally emits these as one merged block, but some hooks can cause
+ * them to arrive split across multiple blocks.  Without coalescing, byte-
+ * identical system text flips between merged/split layouts and moves the
+ * cache_control breakpoint — busting the cache every turn.
+ *
+ * Block layout after prependClaudeCodeIdentity:
+ *   [billing-header?] [identity] [primary system prompt] [plugin blocks…]
+ * We preserve everything up to and including the primary prompt block and
+ * merge all remaining plugin blocks into one.
+ */
+function coalesceHybridSystemTail(parsed: Record<string, unknown>): void {
+  if (!Array.isArray(parsed.system)) return
+
+  const system = parsed.system
+  let prefixCount = 0
+
+  // Skip optional billing-header block (not present in this fork but guard is safe)
+  if (systemBlockText(system[prefixCount]).startsWith('x-anthropic-billing-header:')) {
+    prefixCount++
+  }
+  // Skip identity block
+  if (systemBlockText(system[prefixCount]) === CLAUDE_CODE_IDENTITY) {
+    prefixCount++
+  }
+
+  // tailStart points to the first plugin-added block (one after primary prompt)
+  const tailStart = prefixCount + 1
+  if (tailStart >= system.length - 1) return
+
+  const firstTail = system[tailStart]
+  if (!isRecord(firstTail)) return
+
+  const mergedText = system.slice(tailStart).map(systemBlockText).join('\n')
+  system.splice(tailStart, system.length - tailStart, {
+    ...firstTail,
+    type: 'text',
+    text: mergedText,
+  })
+}
+
 /**
  * Place a cache anchor on the last system block that follows the
  * CLAUDE_CODE_IDENTITY block.  When there are no system blocks, or all
@@ -509,6 +558,7 @@ function stripTrailingAssistantMessages(
  */
 function applyHybridCache1h(parsed: Record<string, unknown>): void {
   removeAllCacheControls(parsed)
+  coalesceHybridSystemTail(parsed)
 
   const messages = Array.isArray(parsed.messages) ? parsed.messages : []
   const { latest, bridge } = selectHybridMessageAnchors(messages)
@@ -614,8 +664,204 @@ export function rewriteRequestBody(body: string): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SSE retryable-error detection (v1.10.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * Error thrown when Anthropic emits a retryable server-side error *inside*
+ * an HTTP 200 stream.  OpenCode recognises ECONNRESET + anthropic-sse syscall
+ * and applies its normal auto-retry flow instead of surfacing an unknown error.
+ */
+export type RetryableAnthropicStreamError = Error & {
+  code: 'ECONNRESET'
+  syscall: 'anthropic-sse'
+  providerErrorType?: string
+}
+
+type SseErrorState = {
+  pending: string
+}
+
+/** Find the first SSE event boundary (\n\n or \r\n\r\n) in a text buffer. */
+function findSseBoundary(
+  value: string,
+): { index: number; length: number } | null {
+  const lf = value.indexOf('\n\n')
+  const crlf = value.indexOf('\r\n\r\n')
+  if (lf === -1) return crlf === -1 ? null : { index: crlf, length: 4 }
+  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
+  return { index: crlf, length: 4 }
+}
+
+function asDiagnosticRecord(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function stringField(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const v = record?.[key]
+  return typeof v === 'string' ? v : undefined
+}
+
+function isRetryableAnthropicStreamError(
+  errorType: string | undefined,
+  message: string,
+): boolean {
+  const t = errorType?.toLowerCase()
+  const m = message.toLowerCase()
+  return (
+    t === 'api_error' ||
+    t === 'overloaded_error' ||
+    t === 'server_error' ||
+    t === 'internal_server_error' ||
+    m.includes('internal server error') ||
+    m.includes('server overloaded')
+  )
+}
+
+function retryableAnthropicStreamError(
+  errorType: string | undefined,
+  message: string,
+): RetryableAnthropicStreamError {
+  const detail = errorType ? `${errorType}: ${message}` : message
+  const err = new Error(
+    `Anthropic stream error: ${detail}`,
+  ) as RetryableAnthropicStreamError
+  err.code = 'ECONNRESET'
+  err.syscall = 'anthropic-sse'
+  if (errorType) err.providerErrorType = errorType
+  return err
+}
+
+function retryableAnthropicStreamErrorFromRawEvent(
+  rawEvent: string,
+): RetryableAnthropicStreamError | null {
+  if (!rawEvent.includes('error')) return null
+
+  let eventName: string | undefined
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('event:')) {
+      eventName = line.slice('event:'.length).trim()
+    } else if (line.startsWith('data:')) {
+      const v = line.slice('data:'.length)
+      dataLines.push(v.startsWith(' ') ? v.slice(1) : v)
+    }
+  }
+
+  const dataText = dataLines.join('\n')
+  if (!dataText || dataText === '[DONE]') return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(dataText)
+  } catch {
+    return null
+  }
+
+  const data = asDiagnosticRecord(parsed)
+  if (eventName !== 'error' && stringField(data, 'type') !== 'error') return null
+
+  const errorObj = asDiagnosticRecord(data?.error)
+  const errorType =
+    stringField(errorObj, 'type') ??
+    stringField(errorObj, 'code') ??
+    undefined
+  const message =
+    stringField(errorObj, 'message') ??
+    stringField(data, 'message') ??
+    errorType ??
+    'Anthropic stream error'
+
+  if (!isRetryableAnthropicStreamError(errorType, message)) return null
+  return retryableAnthropicStreamError(errorType, message)
+}
+
+function createSseErrorState(): SseErrorState {
+  return { pending: '' }
+}
+
+function updateSseErrorState(
+  state: SseErrorState,
+  text: string,
+): RetryableAnthropicStreamError | null {
+  if (!text) return null
+  state.pending += text
+
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) break
+
+    const rawEvent = state.pending.slice(0, boundary.index)
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    const err = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
+    if (err) return err
+  }
+
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Buffered tool-prefix rewriting (v1.10.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rewrite the tool prefix from the safe portion of a text buffer.
+ * Holds back any suffix that could be the start of a partial `"name"` marker
+ * spanning a chunk boundary.  Pass flush=true on stream end to emit everything.
+ */
+function splitToolPrefixRewriteBuffer(
+  buffer: string,
+  flush = false,
+): { ready: string; pending: string } {
+  if (flush) return { ready: stripToolPrefix(buffer), pending: '' }
+
+  let keepFrom = buffer.length
+  const marker = '"name"'
+
+  // Hold back any suffix that starts a partial marker
+  const partialStart = Math.max(0, buffer.length - marker.length + 1)
+  for (let i = partialStart; i < buffer.length; i++) {
+    if (marker.startsWith(buffer.slice(i))) {
+      keepFrom = Math.min(keepFrom, i)
+      break
+    }
+  }
+
+  // Also hold back if the last occurrence of the marker is incomplete
+  const lastMarker = buffer.lastIndexOf(marker)
+  if (lastMarker !== -1) {
+    const tail = buffer.slice(lastMarker)
+    if (/^"name"\s*(?::\s*(?:"[^"]*)?)?$/.test(tail)) {
+      keepFrom = Math.min(keepFrom, lastMarker)
+    }
+  }
+
+  if (keepFrom < buffer.length) {
+    return {
+      ready: stripToolPrefix(buffer.slice(0, keepFrom)),
+      pending: buffer.slice(keepFrom),
+    }
+  }
+
+  return { ready: stripToolPrefix(buffer), pending: '' }
+}
+
+// ---------------------------------------------------------------------------
+// Stream response wrapper
+// ---------------------------------------------------------------------------
+
 /**
  * Create a streaming response that strips the tool prefix from tool names.
+ * Detects retryable Anthropic server errors inside HTTP 200 streams and
+ * throws a connection-reset-style error so OpenCode can auto-retry.
  */
 export function createStrippedStream(response: Response): Response {
   if (!response.body) return response
@@ -623,18 +869,62 @@ export function createStrippedStream(response: Response): Response {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  let pending = ''
+  let readerReleased = false
+  const sseErrors = createSseErrorState()
+
+  const releaseReader = () => {
+    if (readerReleased) return
+    readerReleased = true
+    reader.releaseLock()
+  }
 
   const stream = new ReadableStream({
     async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
+      try {
+        const { done, value } = await reader.read()
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
+        if (done) {
+          const finalDecoded = decoder.decode()
+          const retryableError = updateSseErrorState(sseErrors, finalDecoded)
+          if (retryableError) {
+            releaseReader()
+            throw retryableError
+          }
+
+          const { ready } = splitToolPrefixRewriteBuffer(
+            `${pending}${finalDecoded}`,
+            true,
+          )
+          if (ready) controller.enqueue(encoder.encode(ready))
+          releaseReader()
+          controller.close()
+          return
+        }
+
+        const decoded = decoder.decode(value, { stream: true })
+        const retryableError = updateSseErrorState(sseErrors, decoded)
+        if (retryableError) {
+          releaseReader()
+          throw retryableError
+        }
+
+        const { ready, pending: nextPending } = splitToolPrefixRewriteBuffer(
+          pending + decoded,
+        )
+        pending = nextPending
+        if (ready) controller.enqueue(encoder.encode(ready))
+      } catch (error) {
+        releaseReader()
+        throw error
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason)
+      } finally {
+        releaseReader()
+      }
     },
   })
 
