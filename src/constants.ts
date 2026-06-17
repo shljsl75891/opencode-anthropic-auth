@@ -22,10 +22,12 @@ export const OAUTH_SCOPES = [
 export const TOOL_PREFIX = 'mcp_'
 
 /**
- * Anthropic's sliding-window lookback for cache breakpoints.
- * If the distance (in content blocks) between the previous user-role
- * message anchor and the latest one exceeds this threshold, a bridge
- * anchor is needed so the earlier slots are still within the window.
+ * Anthropic's cache lookback window size. Each explicit breakpoint scans at
+ * most this many content blocks backward (counting the breakpoint block as
+ * position 1, across all roles and types — text, thinking, tool_use,
+ * tool_result, …). When the estimated block count between two user-role anchors
+ * would exceed this threshold, a bridge anchor is inserted to keep the older
+ * breakpoint inside the window and the cached prefix reachable.
  */
 export const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
 
