@@ -31,7 +31,9 @@ export const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
 
 export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
+  'fine-grained-tool-streaming-2025-05-14',
 ]
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
