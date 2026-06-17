@@ -17,6 +17,7 @@ import {
   sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
+  type RetryableAnthropicStreamError,
 } from '../transform'
 
 describe('mergeHeaders', () => {
@@ -800,7 +801,10 @@ describe('rewriteRequestBody', () => {
     expect(result.system[1].text).toBe('Some instructions')
   })
 
-  test('keeps multiple system blocks as separate entries', () => {
+  test('coalesces plugin-added tail blocks beyond primary system prompt', () => {
+    // coalesceHybridSystemTail merges all blocks after [identity, primary] into one.
+    // Input: [First, Second, Third] → after prepend → [identity, First, Second, Third]
+    // tailStart = 2, coalesce [Second, Third] → "Second block\nThird block"
     const body = JSON.stringify({
       system: [
         { type: 'text', text: 'First block' },
@@ -811,12 +815,11 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = identity, system[1..3] = original blocks
-    expect(result.system).toHaveLength(4)
+    // system[0] = identity, system[1] = First block (primary), system[2] = merged tail
+    expect(result.system).toHaveLength(3)
     expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
     expect(result.system[1].text).toBe('First block')
-    expect(result.system[2].text).toBe('Second block')
-    expect(result.system[3].text).toBe('Third block')
+    expect(result.system[2].text).toBe('Second block\nThird block')
 
     // User message content normalised to block array with cache anchor
     expect(result.messages[0].content[0].text).toBe('hi')
@@ -1131,5 +1134,243 @@ describe('sanitizeSystemText – realistic prompt', () => {
     })
     const result = rewriteRequestBody(body)
     expect(JSON.parse(result)).toMatchSnapshot()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// coalesceHybridSystemTail
+// ---------------------------------------------------------------------------
+
+describe('coalesceHybridSystemTail – system block merging', () => {
+  const CACHE_1H = { type: 'ephemeral', ttl: '1h' }
+
+  function body(system: unknown, messages: unknown[] = [{ role: 'user', content: 'hi' }]): string {
+    return JSON.stringify({ system, messages })
+  }
+
+  test('does not coalesce when only one block follows identity + primary prompt', () => {
+    // [identity, primary, one-plugin] → tailStart=2, length-1=2 → no coalesce
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body([
+          { type: 'text', text: 'Primary instructions' },
+          { type: 'text', text: 'Plugin block' },
+        ]),
+      ),
+    )
+    // [identity, Primary, Plugin] — no coalescing
+    expect(result.system).toHaveLength(3)
+    expect(result.system[1].text).toBe('Primary instructions')
+    expect(result.system[2].text).toBe('Plugin block')
+  })
+
+  test('does not coalesce when only identity and primary prompt exist', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(body([{ type: 'text', text: 'Only block' }])),
+    )
+    // [identity, Only block] — no tail blocks to merge
+    expect(result.system).toHaveLength(2)
+    expect(result.system[1].text).toBe('Only block')
+  })
+
+  test('merges two plugin blocks into one after primary prompt', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'Plugin A' },
+          { type: 'text', text: 'Plugin B' },
+        ]),
+      ),
+    )
+    // [identity, Primary, "Plugin A\nPlugin B"]
+    expect(result.system).toHaveLength(3)
+    expect(result.system[1].text).toBe('Primary')
+    expect(result.system[2].text).toBe('Plugin A\nPlugin B')
+  })
+
+  test('merges three plugin blocks into one', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'A' },
+          { type: 'text', text: 'B' },
+          { type: 'text', text: 'C' },
+        ]),
+      ),
+    )
+    // [identity, Primary, "A\nB\nC"]
+    expect(result.system).toHaveLength(3)
+    expect(result.system[2].text).toBe('A\nB\nC')
+  })
+
+  test('cache anchor lands on merged tail block', () => {
+    // Verifies that setHybridSystemAnchor sees the coalesced block correctly
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'Plugin A' },
+          { type: 'text', text: 'Plugin B' },
+        ]),
+      ),
+    )
+    // Anchor should be on the merged block (last block after identity)
+    expect(result.system[result.system.length - 1].cache_control).toEqual(CACHE_1H)
+    // Primary prompt and identity should have no cache anchor
+    expect(result.system[0].cache_control).toBeUndefined()
+    expect(result.system[1].cache_control).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SSE retryable-error detection
+// ---------------------------------------------------------------------------
+
+function makeStream(chunks: string[]): Response {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk))
+      }
+      controller.close()
+    },
+  })
+  return new Response(stream, { status: 200 })
+}
+
+describe('createStrippedStream – SSE retryable errors', () => {
+  test('throws RetryableAnthropicStreamError on api_error event', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Internal error"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.syscall).toBe('anthropic-sse')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('throws on overloaded_error event', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('overloaded_error')
+  })
+
+  test('throws on server_error type', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"Server error"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('server_error')
+  })
+
+  test('throws on "server overloaded" message text', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"unknown","message":"server overloaded"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+  })
+
+  test('does not throw for normal content events', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"role":"assistant"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks))
+    // Should not throw
+    const text = await stripped.text()
+    expect(text).toContain('message_start')
+  })
+
+  test('does not throw for non-retryable error type', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"Invalid key"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    // authentication_error is not retryable — should not throw
+    const text = await stripped.text()
+    expect(text).toContain('authentication_error')
+  })
+
+  test('throws when error event is split across two stream chunks', async () => {
+    const fullEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"oops"}}\n\n'
+    // Split in the middle of the data line
+    const mid = Math.floor(fullEvent.length / 2)
+    const chunks = [fullEvent.slice(0, mid), fullEvent.slice(mid)]
+
+    const stripped = createStrippedStream(makeStream(chunks))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.syscall).toBe('anthropic-sse')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// splitToolPrefixRewriteBuffer – buffered rewriting
+// ---------------------------------------------------------------------------
+
+describe('createStrippedStream – tool prefix rewriting across chunk boundaries', () => {
+  test('strips tool names split across chunk boundaries', async () => {
+    const fullText =
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Bash"}}\n\n'
+    // Split in the middle of "mcp_Bash"
+    const mid = fullText.indexOf('mcp_Bash') + 3
+    const chunks = [fullText.slice(0, mid), fullText.slice(mid)]
+
+    const stripped = createStrippedStream(makeStream(chunks))
+    const text = await stripped.text()
+
+    expect(text).toContain('"name": "bash"')
+    expect(text).not.toContain('mcp_Bash')
   })
 })

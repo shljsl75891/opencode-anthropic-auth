@@ -5,7 +5,7 @@
 >
 > Use your best judgment and don't abuse your subscription.
 
-Fork of [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth).
+Fork of [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth), with caching improvements inspired by [cortexkit/anthropic-auth](https://github.com/cortexkit/anthropic-auth).
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
@@ -27,12 +27,22 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ## Prompt Caching
 
-This fork applies **hybrid 1-hour ephemeral prompt caching** on every request:
+This fork applies **hybrid 1-hour ephemeral prompt caching** on every request, placing up to 4 breakpoints strategically:
 
-- Strips any existing `cache_control` blocks from the request
-- Anchors a `1h` ephemeral cache on the last system block (after identity) and the first two user messages
+| Breakpoint | Behaviour |
+|---|---|
+| **System anchor** | Last system block after the identity block (skipped when bridge occupies the slot) |
+| **messages[0]** | Magic-context split: anchors block[0] + block[1] when stable prefix and volatile delta are merged; otherwise anchors the last cacheable block |
+| **messages[1] / bridge** | Last cacheable block of messages[1]; replaced by a bridge anchor when a tool-heavy session pushes the latest user boundary outside Anthropic's 20-block lookback window |
+| **Rolling latest** | Most recent user message beyond index 1, keeping cache hot across long sessions |
 
-This reduces token usage and latency on repeated requests by reusing cached prompt prefixes.
+Additional behaviours:
+
+- **System tail coalescing** — plugin-added system blocks beyond the primary prompt are merged into one block before placing the system anchor, preventing cache busts when block layout changes between requests
+- **Trailing assistant strip** — assistant messages at the tail of the request are removed before forwarding (OAuth rejects assistant prefill)
+- **Thinking block guard** — `thinking` and `redacted_thinking` blocks are excluded from cache anchor placement; messages containing only thinking blocks receive no `cache_control` (avoids Anthropic 400)
+- **SSE retryable errors** — transient server errors (`api_error`, `overloaded_error`, `server_error`) emitted inside HTTP 200 streams are detected and thrown as connection-reset errors so OpenCode auto-retries
+- **Buffered stream rewriting** — tool name stripping buffers partial `"name"` tokens across chunk boundaries to avoid corruption
 
 ## Configuration
 

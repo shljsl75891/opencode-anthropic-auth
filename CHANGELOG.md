@@ -1,5 +1,29 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.2.0
+
+### Minor Changes
+
+- **SSE retryable-error detection** (ported from cortexkit/anthropic-auth v1.10.0): transient
+  Anthropic server errors (`api_error`, `overloaded_error`, `server_error`, `internal_server_error`)
+  emitted as SSE events inside HTTP 200 streams are now detected and thrown as
+  `ECONNRESET`-coded errors so OpenCode can use its normal auto-retry flow instead of
+  surfacing them as non-retryable unknown failures.
+
+### Patch Changes
+
+- **System tail coalescing** (ported from cortexkit/anthropic-auth v1.10.1): when OpenCode or a
+  plugin emits system instructions split across multiple blocks, all blocks after the primary
+  system prompt block are merged into one before placing the hybrid cache anchor. Prevents the
+  same byte-identical system text from moving the `cache_control` breakpoint when the block
+  layout changes between merged and split forms, which would bust the cache every turn.
+- **Buffered tool-prefix rewriting**: the stream rewriter now holds back any suffix that starts
+  a partial `"name"` marker, ensuring `mcp_` tool names spanning two stream chunks are correctly
+  stripped even when the chunk boundary falls inside the name string.
+- **OAuth fingerprint update**: aligned `CLAUDE_CODE_VERSION` (`2.1.177`), `USER_AGENT`, and
+  `CLAUDE_CODE_ENTRYPOINT` (`cli`) with Claude Code 2.1.177 captured traffic
+  (from cortexkit/anthropic-auth v1.9.4).
+
 ## 2.1.0
 
 ### Minor Changes
