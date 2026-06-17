@@ -647,10 +647,9 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
     expect(result.tools[0].name).toBe('mcp_Bash')
-    // system[0] = billing header, system[1] = identity, system[2] = rest
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('You are a helpful assistant.')
+    // system[0] = identity, system[1] = rest
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('You are a helpful assistant.')
   })
 
   test('handles missing system field', () => {
@@ -658,10 +657,9 @@ describe('rewriteRequestBody', () => {
       messages: [{ role: 'user', content: 'hi' }],
     })
     const result = JSON.parse(rewriteRequestBody(body))
-    // system[0] = billing header, system[1] = identity (no rest block)
-    expect(result.system).toHaveLength(2)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+    // system[0] = identity only (no original system, no billing header)
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
   })
 
   test('returns original string on invalid JSON', () => {
@@ -714,6 +712,8 @@ describe('rewriteRequestBody', () => {
             { type: 'text', text: 'Let me check' },
           ],
         },
+        // Follow-up user turn so the assistant is not trailing (would be stripped)
+        { role: 'user', content: 'What did you find?' },
       ],
       system: [
         { type: 'text', text: systemPrompt },
@@ -723,17 +723,17 @@ describe('rewriteRequestBody', () => {
 
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // Three-block layout: billing header, identity, sanitized blocks
-    expect(result.system).toHaveLength(4)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toContain('You have access to tools.')
-    expect(result.system[2].text).toContain('# Code References')
-    expect(result.system[2].text).not.toContain(OPENCODE_IDENTITY_PREFIX)
-    expect(result.system[3].text).toBe('Additional context block')
+    // identity + sanitized blocks
+    expect(result.system).toHaveLength(3)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toContain('You have access to tools.')
+    expect(result.system[1].text).toContain('# Code References')
+    expect(result.system[1].text).not.toContain(OPENCODE_IDENTITY_PREFIX)
+    expect(result.system[2].text).toBe('Additional context block')
 
-    // User messages are untouched
-    expect(result.messages[0].content).toBe('Help me fix this bug')
+    // User message content normalised to block array with cache anchor
+    expect(result.messages[0].content[0].text).toBe('Help me fix this bug')
+    // Assistant tool name prefixed (messages[1] kept — not trailing)
     expect(result.messages[1].content[0].name).toBe('mcp_Bash')
   })
 
@@ -752,14 +752,13 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2] = rest
-    expect(result.system).toHaveLength(3)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('Custom instructions for the assistant.')
+    // system[0] = identity, system[1] = rest
+    expect(result.system).toHaveLength(2)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('Custom instructions for the assistant.')
 
-    // User message is untouched
-    expect(result.messages[0].content).toBe('hello')
+    // User message content normalised to block array with cache anchor
+    expect(result.messages[0].content[0].text).toBe('hello')
   })
 
   test('keeps system blocks in system[] (array content)', () => {
@@ -777,12 +776,11 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2..3] = rest
-    expect(result.system).toHaveLength(4)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('Block A instructions')
-    expect(result.system[3].text).toBe('Block B instructions')
+    // system[0] = identity, system[1..2] = rest
+    expect(result.system).toHaveLength(3)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('Block A instructions')
+    expect(result.system[2].text).toBe('Block B instructions')
 
     // User message is untouched
     expect(result.messages[0].content).toHaveLength(1)
@@ -813,16 +811,15 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2..4] = original blocks
-    expect(result.system).toHaveLength(5)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('First block')
-    expect(result.system[3].text).toBe('Second block')
-    expect(result.system[4].text).toBe('Third block')
+    // system[0] = identity, system[1..3] = original blocks
+    expect(result.system).toHaveLength(4)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('First block')
+    expect(result.system[2].text).toBe('Second block')
+    expect(result.system[3].text).toBe('Third block')
 
-    // User message is untouched
-    expect(result.messages[0].content).toBe('hi')
+    // User message content normalised to block array with cache anchor
+    expect(result.messages[0].content[0].text).toBe('hi')
   })
 })
 
@@ -831,6 +828,290 @@ describe('rewriteRequestBody', () => {
 // ---------------------------------------------------------------------------
 
 import { REALISTIC_SYSTEM_PROMPT } from './fixtures/realistic-system-prompt'
+
+// ---------------------------------------------------------------------------
+// Hybrid cache breakpoint tests
+// ---------------------------------------------------------------------------
+
+function makeMsg(
+  role: string,
+  content: string | Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  return { role, content }
+}
+
+function textBlock(text: string): Record<string, unknown> {
+  return { type: 'text', text }
+}
+
+function cacheControl(parsed: ReturnType<typeof JSON.parse>, path: string) {
+  // Helper to reach nested cache_control by dot-path, e.g. "messages.0.content.0"
+  const parts = path.split('.')
+  let node: unknown = parsed
+  for (const part of parts) {
+    node = (node as Record<string, unknown>)[part]
+  }
+  return (node as Record<string, unknown>).cache_control
+}
+
+describe('hybrid cache – breakpoint placement', () => {
+  const CACHE_1H = { type: 'ephemeral', ttl: '1h' }
+
+  function body(opts: {
+    system?: unknown
+    messages: unknown[]
+  }): string {
+    return JSON.stringify({ system: opts.system ?? 'Instructions.', messages: opts.messages })
+  }
+
+  test('strips all existing cache_control before placing new ones', () => {
+    const raw = JSON.stringify({
+      system: [
+        { type: 'text', text: 'block', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'hi', cacheControl: { type: 'ephemeral' } }],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(raw))
+    // Only the new 1h anchor should remain; no stale ephemeral without ttl
+    const ccs: unknown[] = []
+    for (const block of result.system) {
+      if (block.cache_control) ccs.push(block.cache_control)
+    }
+    for (const cc of ccs) {
+      expect(cc).toMatchObject({ ttl: '1h' })
+    }
+  })
+
+  test('anchors last system block (after identity) with 1h cache', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          system: [
+            { type: 'text', text: 'Block A' },
+            { type: 'text', text: 'Block B' },
+          ],
+          messages: [makeMsg('user', 'hello')],
+        }),
+      ),
+    )
+    // system = [identity, Block A, Block B]
+    // Anchor on last block after identity → system[2] = Block B
+    expect(result.system[2].cache_control).toEqual(CACHE_1H)
+    expect(result.system[1].cache_control).toBeUndefined()
+    expect(result.system[0].cache_control).toBeUndefined()
+  })
+
+  test('does not anchor system block when only identity is present', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(body({ system: undefined, messages: [makeMsg('user', 'hello')] })),
+    )
+    // system = [identity] only — nothing after identity to anchor
+    expect(result.system[0].cache_control).toBeUndefined()
+  })
+
+  test('anchors last cacheable block of messages[0]', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', [textBlock('only block')]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('anchors last cacheable block of messages[1] (normal path)', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', 'msg0'),
+            makeMsg('user', [textBlock('msg1 block')]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('skips thinking blocks when placing cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', [
+              { type: 'thinking', thinking: 'some reasoning' },
+              textBlock('actual content'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    // Anchor on text block, not thinking block
+    expect(result.messages[0].content[1].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('skips redacted_thinking blocks when placing cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', [
+              { type: 'redacted_thinking', data: 'opaque' },
+              textBlock('real content'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[1].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('skips message entirely when all blocks are thinking (no cache_control set)', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', [
+              { type: 'thinking', thinking: 'reasoning only' },
+            ]),
+          ],
+        }),
+      ),
+    )
+    // No cache_control on the message itself or its blocks
+    expect(result.messages[0].cache_control).toBeUndefined()
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('magic-context split: anchors block[0] and block[1] of messages[0] when it has ≥2 cacheable blocks', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', [
+              textBlock('stable prefix A'),
+              textBlock('stable prefix B'),
+              textBlock('volatile delta'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    const content = result.messages[0].content
+    expect(content[0].cache_control).toEqual(CACHE_1H)
+    expect(content[1].cache_control).toEqual(CACHE_1H)
+    expect(content[2].cache_control).toBeUndefined()
+  })
+
+  test('rolling latest anchor: anchors the latest user message beyond index 1', () => {
+    const messages = [
+      makeMsg('user', 'msg0'),
+      makeMsg('user', 'msg1'),
+      makeMsg('assistant', [{ type: 'text', text: 'response' }]),
+      makeMsg('user', 'msg3 – latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(body({ messages })))
+    // messages[3] is latest user beyond index 1 → should be anchored
+    const msg3content = result.messages[3].content
+    // string content gets normalised to array
+    expect(Array.isArray(msg3content)).toBe(true)
+    expect(msg3content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('bridge anchor: when latest is >20 blocks away from previous, bridge placed and system anchor reclaimed', () => {
+    // Build a long session with 25 user messages (index > 1), each with 1 block,
+    // so cumulative from bridge candidate to latest exceeds 20.
+    const messages: unknown[] = [
+      makeMsg('user', 'msg0'),
+      makeMsg('user', 'msg1'),
+    ]
+    for (let i = 2; i < 30; i++) {
+      messages.push(makeMsg('user', `msg${i}`))
+    }
+    const result = JSON.parse(rewriteRequestBody(body({ messages })))
+
+    // Count how many messages got a cache_control on their content
+    let anchoredCount = 0
+    for (const msg of result.messages) {
+      const content = Array.isArray(msg.content) ? msg.content : []
+      for (const block of content) {
+        if (block.cache_control) anchoredCount++
+      }
+    }
+    // Should have at least 3 message anchors (msg0, bridge, latest)
+    expect(anchoredCount).toBeGreaterThanOrEqual(3)
+  })
+
+  test('trailing assistant messages are stripped before caching', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', 'question'),
+            makeMsg('assistant', 'answer'),
+          ],
+        }),
+      ),
+    )
+    // Trailing assistant stripped → only user message remains
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('multiple trailing assistant messages all stripped', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', 'q'),
+            makeMsg('assistant', 'a1'),
+            makeMsg('assistant', 'a2'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('does not strip non-trailing assistant messages', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [
+            makeMsg('user', 'q1'),
+            makeMsg('assistant', 'a1'),
+            makeMsg('user', 'q2'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages).toHaveLength(3)
+  })
+
+  test('string message content normalised to block array for cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        body({
+          messages: [makeMsg('user', 'plain string content')],
+        }),
+      ),
+    )
+    // Content normalised to array and anchor set
+    expect(Array.isArray(result.messages[0].content)).toBe(true)
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+  })
+})
 
 describe('sanitizeSystemText – realistic prompt', () => {
   test('sanitizeSystemText output snapshot', () => {

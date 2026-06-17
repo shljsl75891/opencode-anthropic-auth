@@ -207,15 +207,14 @@ describe('auth.loader', () => {
     const parsedBody = JSON.parse(capturedBody!)
     // Tool name should be prefixed
     expect(parsedBody.tools[0].name).toBe('mcp_Bash')
-    // Three-block layout: billing header, identity, rest
-    expect(parsedBody.system).toHaveLength(3)
-    expect(parsedBody.system[0].text).toContain('x-anthropic-billing-header')
-    expect(parsedBody.system[1].text).toBe(
+    // Two-block layout: identity, rest (billing header removed in 1e03543)
+    expect(parsedBody.system).toHaveLength(2)
+    expect(parsedBody.system[0].text).toBe(
       "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
     )
-    expect(parsedBody.system[2].text).toBe('You are a helpful assistant.')
-    // User message is untouched
-    expect(parsedBody.messages[0].content).toBe('hello world test message')
+    expect(parsedBody.system[1].text).toBe('You are a helpful assistant.')
+    // User message content normalised to block array with cache anchor
+    expect(parsedBody.messages[0].content[0].text).toBe('hello world test message')
   })
 
   test('fetch wrapper refreshes expired token', async () => {
