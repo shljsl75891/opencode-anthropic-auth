@@ -9,20 +9,11 @@ import {
   USER_AGENT,
 } from './constants.ts'
 
-/**
- * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
- * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
- * lowercase names (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
- */
 function prefixName(name: string): string {
   return `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`
 }
 
-/**
- * Reverse prefixName: strip TOOL_PREFIX and restore the original leading case.
- */
 function unprefixName(name: string): string {
-  // StructuredOutput is still used as StructuredOutput
   if (name === 'StructuredOutput') {
     return name
   }
@@ -83,7 +74,7 @@ export function mergeBetaHeaders(headers: Headers): string {
 }
 
 /**
- * Set OAuth-required headers on the request: authorization, beta, user-agent.
+ * Set OAuth-required headers: authorization, beta, user-agent.
  * Removes x-api-key since we're using OAuth.
  */
 export function setOAuthHeaders(
@@ -183,7 +174,6 @@ function resolveBaseUrl(): URL | null {
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
  * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
  * for all API requests flowing through the fetch wrapper.
- * Returns the modified input and URL (if applicable).
  */
 export function rewriteUrl(input: FetchInput): {
   input: FetchInput
@@ -243,16 +233,13 @@ export function rewriteUrl(input: FetchInput): {
  * somewhere in the paragraph, the removal works.
  */
 export function sanitizeSystemText(text: string): string {
-  // Split into paragraphs (separated by one or more blank lines)
   const paragraphs = text.split(/\n\n+/)
 
   const filtered = paragraphs.filter((paragraph) => {
     if (paragraph.includes(OPENCODE_IDENTITY_PREFIX)) {
-      // If the paragraph contains the identity, drop it entirely
       return false
     }
 
-    // Remove paragraphs containing any removal anchor
     for (const anchor of PARAGRAPH_REMOVAL_ANCHORS) {
       if (paragraph.includes(anchor)) return false
     }
@@ -262,7 +249,6 @@ export function sanitizeSystemText(text: string): string {
 
   let result = filtered.join('\n\n')
 
-  // Apply inline text replacements
   for (const rule of TEXT_REPLACEMENTS) {
     result = result.replace(rule.match, rule.replacement)
   }
@@ -277,10 +263,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const CACHE_1H = { type: 'ephemeral', ttl: '1h' } as const
-
-// ---------------------------------------------------------------------------
-// Cache control primitives
-// ---------------------------------------------------------------------------
 
 function removeCacheControl(value: unknown): void {
   if (!isRecord(value)) return
@@ -308,22 +290,24 @@ function setWireCacheControl(value: unknown): boolean {
   return true
 }
 
-// ---------------------------------------------------------------------------
-// Content-block helpers
-// ---------------------------------------------------------------------------
-
 /**
  * Returns true for content block types that accept cache_control.
- * Anthropic rejects cache_control on thinking / redacted_thinking blocks.
+ * Anthropic rejects cache_control on thinking / redacted_thinking blocks
+ * and silently skips empty text blocks without caching them.
  */
-function isCacheableContentBlock(block: unknown): block is Record<string, unknown> {
+function isCacheableContentBlock(
+  block: unknown,
+): block is Record<string, unknown> {
   if (!isRecord(block)) return false
-  return block.type !== 'thinking' && block.type !== 'redacted_thinking'
+  if (block.type === 'thinking' || block.type === 'redacted_thinking')
+    return false
+  if (block.type === 'text' && !String(block.text ?? '').trim()) return false
+  return true
 }
 
 /**
  * Normalises message content to an array of blocks, then filters to only
- * cacheable types.  Returns undefined when there is nothing to anchor.
+ * cacheable types. Returns undefined when there is nothing to anchor.
  */
 function getCacheableContentBlocks(
   message: unknown,
@@ -334,7 +318,6 @@ function getCacheableContentBlocks(
   if (Array.isArray(message.content)) {
     blocks = message.content
   } else if (typeof message.content === 'string') {
-    // Normalise inline string to block array in place so downstream sees array
     const normalised = [{ type: 'text', text: message.content }]
     message.content = normalised
     blocks = normalised
@@ -346,74 +329,45 @@ function getCacheableContentBlocks(
   return cacheable.length > 0 ? cacheable : undefined
 }
 
-/**
- * Total cacheable content-block count for a message (used for lookback math).
- */
 function messageContentBlockCount(message: unknown): number {
   return getCacheableContentBlocks(message)?.length ?? 0
 }
 
-// ---------------------------------------------------------------------------
-// Message-anchor setters
-// ---------------------------------------------------------------------------
-
-/**
- * Anchor the last cacheable block of a message.
- * Returns false (and sets nothing) when there are no cacheable blocks.
- */
 function setMessageCacheAnchor(message: unknown): boolean {
   const blocks = getCacheableContentBlocks(message)
   if (!blocks) return false
   return setWireCacheControl(blocks[blocks.length - 1])
 }
 
-/**
- * Anchor the FIRST cacheable block of a message (for magic-context split).
- */
 function setFirstMessageCacheAnchor(message: unknown): boolean {
   const blocks = getCacheableContentBlocks(message)
   if (!blocks) return false
   return setWireCacheControl(blocks[0])
 }
 
-/**
- * Anchor the SECOND cacheable block of a message (for magic-context split).
- * Returns false when fewer than two cacheable blocks exist.
- */
 function setSecondMessageCacheAnchor(message: unknown): boolean {
   const blocks = getCacheableContentBlocks(message)
   if (!blocks || blocks.length < 2) return false
   return setWireCacheControl(blocks[1])
 }
 
-// ---------------------------------------------------------------------------
-// Rolling-anchor selection
-// ---------------------------------------------------------------------------
-
 type MessageAnchorPosition = {
-  /** Index into messages array */
   index: number
-  /** Number of cacheable blocks in this message (for lookback accounting) */
   blockCount: number
 }
 
 type HybridMessageAnchors = {
-  /** Latest user/tool-result message beyond index 1 */
   latest: MessageAnchorPosition | undefined
-  /** Previous user/tool-result when distance to latest > lookback window */
   bridge: MessageAnchorPosition | undefined
 }
 
 /**
- * Walk all messages and collect user-role (or tool_result) anchor positions.
+ * Walk all messages and collect user-role anchor positions.
  * Returns the `latest` position (index > 1) and a `bridge` position placed
  * whenever the cumulative block distance from bridge→latest exceeds
  * ANTHROPIC_CACHE_LOOKBACK_BLOCKS, ensuring both are within the sliding window.
  */
-function selectHybridMessageAnchors(
-  messages: unknown[],
-): HybridMessageAnchors {
-  // Collect positions of user-role messages that have cacheable content
+function selectHybridMessageAnchors(messages: unknown[]): HybridMessageAnchors {
   const userPositions: MessageAnchorPosition[] = messages
     .map((msg, index) => {
       if (!isRecord(msg)) return null
@@ -424,17 +378,14 @@ function selectHybridMessageAnchors(
     })
     .filter((p): p is MessageAnchorPosition => p !== null)
 
-  // We only care about positions beyond index 1 (0 and 1 are always anchored)
   const rollingPositions = userPositions.filter((p) => p.index > 1)
   if (rollingPositions.length === 0) {
     return { latest: undefined, bridge: undefined }
   }
 
-  // Non-null: rollingPositions is non-empty (early return guards above)
   // biome-ignore lint/style/noNonNullAssertion: guarded by length check above
   const latest = rollingPositions[rollingPositions.length - 1]!
 
-  // Find a bridge: walk back from latest until cumulative blocks exceed window
   let bridge: MessageAnchorPosition | undefined
   let cumulativeBlocks = latest.blockCount
   for (let i = rollingPositions.length - 2; i >= 0; i--) {
@@ -449,10 +400,6 @@ function selectHybridMessageAnchors(
   return { latest, bridge }
 }
 
-// ---------------------------------------------------------------------------
-// System-anchor setter
-// ---------------------------------------------------------------------------
-
 function systemBlockText(block: unknown): string {
   return isRecord(block) && typeof block.text === 'string' ? block.text : ''
 }
@@ -463,7 +410,7 @@ function systemBlockText(block: unknown): string {
  * system cache anchor.
  *
  * OpenCode normally emits these as one merged block, but some hooks can cause
- * them to arrive split across multiple blocks.  Without coalescing, byte-
+ * them to arrive split across multiple blocks. Without coalescing, byte-
  * identical system text flips between merged/split layouts and moves the
  * cache_control breakpoint — busting the cache every turn.
  *
@@ -478,16 +425,17 @@ function coalesceHybridSystemTail(parsed: Record<string, unknown>): void {
   const system = parsed.system
   let prefixCount = 0
 
-  // Skip optional billing-header block (not present in this fork but guard is safe)
-  if (systemBlockText(system[prefixCount]).startsWith('x-anthropic-billing-header:')) {
+  if (
+    systemBlockText(system[prefixCount]).startsWith(
+      'x-anthropic-billing-header:',
+    )
+  ) {
     prefixCount++
   }
-  // Skip identity block
   if (systemBlockText(system[prefixCount]) === CLAUDE_CODE_IDENTITY) {
     prefixCount++
   }
 
-  // tailStart points to the first plugin-added block (one after primary prompt)
   const tailStart = prefixCount + 1
   if (tailStart >= system.length - 1) return
 
@@ -504,8 +452,8 @@ function coalesceHybridSystemTail(parsed: Record<string, unknown>): void {
 
 /**
  * Place a cache anchor on the last system block that follows the
- * CLAUDE_CODE_IDENTITY block.  When there are no system blocks, or all
- * system blocks precede the identity, nothing is anchored.
+ * CLAUDE_CODE_IDENTITY block. When there are no system blocks after the
+ * identity, nothing is anchored.
  */
 function setHybridSystemAnchor(parsed: Record<string, unknown>): void {
   if (!Array.isArray(parsed.system)) return
@@ -520,17 +468,11 @@ function setHybridSystemAnchor(parsed: Record<string, unknown>): void {
   setWireCacheControl(afterIdentity[afterIdentity.length - 1])
 }
 
-// ---------------------------------------------------------------------------
-// Trailing-assistant strip (Tier 2)
-// ---------------------------------------------------------------------------
-
 /**
- * Remove trailing assistant-role messages.  OAuth endpoints reject requests
+ * Remove trailing assistant-role messages. OAuth endpoints reject requests
  * that end with an assistant turn (assistant prefill is not supported).
  */
-function stripTrailingAssistantMessages(
-  parsed: Record<string, unknown>,
-): void {
+function stripTrailingAssistantMessages(parsed: Record<string, unknown>): void {
   if (!Array.isArray(parsed.messages)) return
   while (
     parsed.messages.length > 0 &&
@@ -541,20 +483,35 @@ function stripTrailingAssistantMessages(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Main hybrid cache logic
-// ---------------------------------------------------------------------------
+/**
+ * Returns true when messages[0] carries a merged stable-prefix layout
+ * (≥2 cacheable blocks). In that case anchoring the last block would bust
+ * the cache every turn because the tail is volatile; instead we anchor
+ * block[0] and block[1] (the two stable-prefix blocks).
+ */
+function isMagicContextLayout(blocks: Record<string, unknown>[]): boolean {
+  return blocks.length >= 2
+}
 
 /**
  * Apply hybrid 1h prompt-caching breakpoints to parsed request body.
  *
- * Breakpoint slots (Anthropic supports max 4 per request):
- *   1. Last system block after the identity block  (skipped when bridge used)
- *   2. messages[0] — first cacheable block         (magic-context: slot 2a)
- *   3. messages[0] — second cacheable block        (magic-context split only)
- *      OR messages[1] last cacheable block         (normal path)
- *      OR bridge user message                      (when bridge detected)
- *   4. Latest user/tool-result message (index > 1) (when present)
+ * Anthropic supports max 4 cache breakpoints per request. Slot allocation:
+ *
+ *   Slot 1 — system anchor: last block after identity.
+ *             Skipped when a bridge is used (bridge takes that slot).
+ *
+ *   Slots 2+3 — messages[0]:
+ *     • Normal layout (1 cacheable block): slot 2 = last block of msg[0];
+ *       slot 3 = bridge message OR messages[1] (no bridge).
+ *     • Magic-context layout (≥2 cacheable blocks): slot 2 = block[0],
+ *       slot 3 = block[1]. messages[1] is skipped (msg[0] uses both slots).
+ *
+ *   Slot 4 — rolling latest: last user/tool-result message beyond index 1.
+ *
+ * Bridge and magic-context are independent: when both apply simultaneously,
+ * the slot budget is: system(skipped) + msg0-block0 + bridge + latest = 4.
+ * The bridge anchor is ALWAYS placed when detected, regardless of msg0 layout.
  */
 function applyHybridCache1h(parsed: Record<string, unknown>): void {
   removeAllCacheControls(parsed)
@@ -563,32 +520,26 @@ function applyHybridCache1h(parsed: Record<string, unknown>): void {
   const messages = Array.isArray(parsed.messages) ? parsed.messages : []
   const { latest, bridge } = selectHybridMessageAnchors(messages)
 
-  // --- Slot 1: system anchor (skip when bridge will occupy a slot) ---
   if (!bridge) {
     setHybridSystemAnchor(parsed)
   }
 
-  // --- Slots 2 & 3: messages[0] ---
   const msg0 = messages[0]
   const msg0Blocks = getCacheableContentBlocks(msg0)
-  if (msg0Blocks && msg0Blocks.length >= 2) {
-    // Magic-context split: stable prefix is in block[0] and block[1];
-    // anchoring last block would bust cache every turn.
+  if (msg0Blocks && isMagicContextLayout(msg0Blocks)) {
     setFirstMessageCacheAnchor(msg0)
     setSecondMessageCacheAnchor(msg0)
   } else {
     setMessageCacheAnchor(msg0)
-
-    // --- Slot 3 (normal): messages[1] or bridge ---
-    if (bridge) {
-      setHybridSystemAnchor(parsed) // system anchor reclaimed for bridge support
-      setMessageCacheAnchor(messages[bridge.index])
-    } else {
+    if (!bridge) {
       setMessageCacheAnchor(messages[1])
     }
   }
 
-  // --- Slot 4: rolling latest user anchor ---
+  if (bridge) {
+    setMessageCacheAnchor(messages[bridge.index])
+  }
+
   if (latest) {
     setMessageCacheAnchor(messages[latest.index])
   }
@@ -640,7 +591,6 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
     return { type: 'text', text: String(item) }
   })
 
-  // Idempotency: don't double-prepend if first block already has the identity
   if (sanitized[0]?.text === CLAUDE_CODE_IDENTITY) {
     return sanitized
   }
@@ -648,10 +598,6 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
   return [identityBlock, ...sanitized]
 }
 
-/**
- * Rewrite the full request body: sanitize system prompt, prefix tool names,
- * and apply hybrid 1h prompt caching.
- */
 export function rewriteRequestBody(body: string): string {
   try {
     const parsed = JSON.parse(body)
@@ -664,13 +610,9 @@ export function rewriteRequestBody(body: string): string {
   }
 }
 
-// ---------------------------------------------------------------------------
-// SSE retryable-error detection (v1.10.0)
-// ---------------------------------------------------------------------------
-
 /**
- * Error thrown when Anthropic emits a retryable server-side error *inside*
- * an HTTP 200 stream.  OpenCode recognises ECONNRESET + anthropic-sse syscall
+ * Error thrown when Anthropic emits a retryable server-side error inside
+ * an HTTP 200 stream. OpenCode recognises ECONNRESET + anthropic-sse syscall
  * and applies its normal auto-retry flow instead of surfacing an unknown error.
  */
 export type RetryableAnthropicStreamError = Error & {
@@ -683,7 +625,6 @@ type SseErrorState = {
   pending: string
 }
 
-/** Find the first SSE event boundary (\n\n or \r\n\r\n) in a text buffer. */
 function findSseBoundary(
   value: string,
 ): { index: number; length: number } | null {
@@ -767,13 +708,12 @@ function retryableAnthropicStreamErrorFromRawEvent(
   }
 
   const data = asDiagnosticRecord(parsed)
-  if (eventName !== 'error' && stringField(data, 'type') !== 'error') return null
+  if (eventName !== 'error' && stringField(data, 'type') !== 'error')
+    return null
 
   const errorObj = asDiagnosticRecord(data?.error)
   const errorType =
-    stringField(errorObj, 'type') ??
-    stringField(errorObj, 'code') ??
-    undefined
+    stringField(errorObj, 'type') ?? stringField(errorObj, 'code') ?? undefined
   const message =
     stringField(errorObj, 'message') ??
     stringField(data, 'message') ??
@@ -808,14 +748,10 @@ function updateSseErrorState(
   return null
 }
 
-// ---------------------------------------------------------------------------
-// Buffered tool-prefix rewriting (v1.10.0)
-// ---------------------------------------------------------------------------
-
 /**
  * Rewrite the tool prefix from the safe portion of a text buffer.
  * Holds back any suffix that could be the start of a partial `"name"` marker
- * spanning a chunk boundary.  Pass flush=true on stream end to emit everything.
+ * spanning a chunk boundary. Pass flush=true on stream end to emit everything.
  */
 function splitToolPrefixRewriteBuffer(
   buffer: string,
@@ -826,7 +762,6 @@ function splitToolPrefixRewriteBuffer(
   let keepFrom = buffer.length
   const marker = '"name"'
 
-  // Hold back any suffix that starts a partial marker
   const partialStart = Math.max(0, buffer.length - marker.length + 1)
   for (let i = partialStart; i < buffer.length; i++) {
     if (marker.startsWith(buffer.slice(i))) {
@@ -835,7 +770,6 @@ function splitToolPrefixRewriteBuffer(
     }
   }
 
-  // Also hold back if the last occurrence of the marker is incomplete
   const lastMarker = buffer.lastIndexOf(marker)
   if (lastMarker !== -1) {
     const tail = buffer.slice(lastMarker)
@@ -853,10 +787,6 @@ function splitToolPrefixRewriteBuffer(
 
   return { ready: stripToolPrefix(buffer), pending: '' }
 }
-
-// ---------------------------------------------------------------------------
-// Stream response wrapper
-// ---------------------------------------------------------------------------
 
 /**
  * Create a streaming response that strips the tool prefix from tool names.
@@ -886,8 +816,18 @@ export function createStrippedStream(response: Response): Response {
 
         if (done) {
           const finalDecoded = decoder.decode()
-          const retryableError = updateSseErrorState(sseErrors, finalDecoded)
+          let retryableError = updateSseErrorState(sseErrors, finalDecoded)
+          if (!retryableError && sseErrors.pending) {
+            retryableError = retryableAnthropicStreamErrorFromRawEvent(
+              sseErrors.pending,
+            )
+          }
           if (retryableError) {
+            try {
+              await reader.cancel()
+            } catch {
+              /* ignore cancel failure */
+            }
             releaseReader()
             throw retryableError
           }
@@ -905,6 +845,11 @@ export function createStrippedStream(response: Response): Response {
         const decoded = decoder.decode(value, { stream: true })
         const retryableError = updateSseErrorState(sseErrors, decoded)
         if (retryableError) {
+          try {
+            await reader.cancel()
+          } catch {
+            /* ignore cancel failure */
+          }
           releaseReader()
           throw retryableError
         }
