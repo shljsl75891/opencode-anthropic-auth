@@ -1,5 +1,30 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.4.0
+
+### Minor Changes
+
+- **Orphaned tool_use/tool_result repair** (inspired by griffinmartin/opencode-claude-auth): requests
+  are now scanned for `tool_use` blocks with no matching `tool_result` (and vice versa) before being
+  sent upstream. Orphaned blocks are dropped, and messages left with empty content after repair are
+  removed entirely. This prevents Anthropic 400 rejections when OpenCode truncates or reconstructs
+  conversation history (e.g. after an interruption) and leaves an unpaired tool call/result behind.
+
+  **Exclude `interleaved-thinking-2025-05-14` beta for Haiku models** (inspired by
+  griffinmartin/opencode-claude-auth): Haiku models don't support interleaved thinking, so the beta
+  header is now omitted for Haiku requests to match real Claude Code CLI behavior. `mergeBetaHeaders`
+  and `setOAuthHeaders` accept an optional model id, and the fetch wrapper now reads the model from
+  the request body before setting headers so this exclusion can be applied.
+
+  **Strip unsupported `effort` parameters for Haiku models** (inspired by
+  griffinmartin/opencode-claude-auth): Anthropic rejects `output_config.effort` and `thinking.effort`
+  for Haiku models. These fields are now stripped from the request body for Haiku, removing the
+  parent object entirely if it becomes empty as a result.
+
+  **429 retry-after capped backoff** (inspired by griffinmartin/opencode-claude-auth): rate-limited
+  (`429`) responses are now retried automatically, honoring the `retry-after` response header when
+  present (capped at 30s) and falling back to capped exponential backoff otherwise, up to 3 retries.
+
 ## 2.3.0
 
 ### Patch Changes
