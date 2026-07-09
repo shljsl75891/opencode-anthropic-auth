@@ -61,16 +61,32 @@ export function mergeHeaders(input: FetchInput, init?: RequestInit): Headers {
 }
 
 /**
- * Merge incoming beta headers with the required OAuth betas, deduplicating.
+ * Anthropic rejects interleaved-thinking on Haiku models — this checks
+ * whether a model id refers to a Haiku model.
  */
-export function mergeBetaHeaders(headers: Headers): string {
+function isHaikuModel(modelId: string | undefined): boolean {
+  return /haiku/i.test(modelId ?? '')
+}
+
+/**
+ * Merge incoming beta headers with the required OAuth betas, deduplicating.
+ * Excludes betas unsupported by the target model (e.g. interleaved-thinking
+ * on Haiku models).
+ */
+export function mergeBetaHeaders(headers: Headers, modelId?: string): string {
   const incomingBeta = headers.get('anthropic-beta') || ''
   const incomingBetasList = incomingBeta
     .split(',')
     .map((b) => b.trim())
     .filter(Boolean)
 
-  return [...new Set([...REQUIRED_BETAS, ...incomingBetasList])].join(',')
+  const requiredBetas = isHaikuModel(modelId)
+    ? REQUIRED_BETAS.filter(
+        (beta) => beta !== 'interleaved-thinking-2025-05-14',
+      )
+    : REQUIRED_BETAS
+
+  return [...new Set([...requiredBetas, ...incomingBetasList])].join(',')
 }
 
 /**
@@ -80,12 +96,27 @@ export function mergeBetaHeaders(headers: Headers): string {
 export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
+  modelId?: string,
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
-  headers.set('anthropic-beta', mergeBetaHeaders(headers))
+  headers.set('anthropic-beta', mergeBetaHeaders(headers, modelId))
   headers.set('user-agent', USER_AGENT)
   headers.delete('x-api-key')
   return headers
+}
+
+/**
+ * Extract the `model` field from a JSON request body string, if present.
+ * Used to make header rewriting (e.g. beta exclusions) model-aware before
+ * the body itself is parsed and transformed.
+ */
+export function extractModelId(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body)
+    return typeof parsed?.model === 'string' ? parsed.model : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -483,6 +514,101 @@ function setHybridSystemAnchor(parsed: Record<string, unknown>): void {
   setWireCacheControl(afterIdentity[afterIdentity.length - 1])
 }
 
+const RETRY_AFTER_CAP_MS = 30000
+const RETRY_BASE_DELAY_MS = 500
+
+/**
+ * Compute the delay before retrying a 429 response. Prefers the
+ * `retry-after` header (seconds) when present and valid, otherwise falls
+ * back to exponential backoff. Always capped at RETRY_AFTER_CAP_MS to avoid
+ * honouring an excessively long server-provided wait.
+ */
+export function computeRetryAfterDelayMs(
+  retryAfterHeader: string | null,
+  attempt: number,
+): number {
+  const seconds = retryAfterHeader ? Number(retryAfterHeader) : Number.NaN
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1000
+    : RETRY_BASE_DELAY_MS * 2 ** attempt
+
+  return Math.min(delay, RETRY_AFTER_CAP_MS)
+}
+
+/**
+ * Anthropic rejects the `effort` parameter for Haiku models. Strips
+ * `output_config.effort` and `thinking.effort`, removing the parent object
+ * entirely if `effort` was its only field.
+ */
+function stripUnsupportedEffortForHaiku(parsed: Record<string, unknown>): void {
+  if (
+    !isHaikuModel(typeof parsed.model === 'string' ? parsed.model : undefined)
+  )
+    return
+
+  const outputConfig = parsed.output_config
+  if (isRecord(outputConfig) && 'effort' in outputConfig) {
+    delete outputConfig.effort
+    if (Object.keys(outputConfig).length === 0) delete parsed.output_config
+  }
+
+  const thinking = parsed.thinking
+  if (isRecord(thinking) && 'effort' in thinking) {
+    delete thinking.effort
+    if (Object.keys(thinking).length === 0) delete parsed.thinking
+  }
+}
+
+/**
+ * Remove tool_use blocks with no matching tool_result, and tool_result
+ * blocks that reference a non-existent tool_use. Anthropic rejects requests
+ * with unpaired tool_use/tool_result blocks — this can happen when OpenCode
+ * truncates or reconstructs conversation history after an interruption.
+ * Messages left with no content blocks are dropped entirely.
+ */
+function repairOrphanedToolPairs(parsed: Record<string, unknown>): void {
+  if (!Array.isArray(parsed.messages)) return
+
+  const toolUseIds = new Set<string>()
+  const toolResultIds = new Set<string>()
+
+  for (const msg of parsed.messages) {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (!isRecord(block)) continue
+      if (block.type === 'tool_use' && typeof block.id === 'string') {
+        toolUseIds.add(block.id)
+      } else if (
+        block.type === 'tool_result' &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        toolResultIds.add(block.tool_use_id)
+      }
+    }
+  }
+
+  parsed.messages = parsed.messages.filter((msg) => {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) return true
+
+    const filteredContent = msg.content.filter((block) => {
+      if (!isRecord(block)) return true
+      if (block.type === 'tool_use' && typeof block.id === 'string') {
+        return toolResultIds.has(block.id)
+      }
+      if (
+        block.type === 'tool_result' &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        return toolUseIds.has(block.tool_use_id)
+      }
+      return true
+    })
+    msg.content = filteredContent
+
+    return filteredContent.length > 0
+  })
+}
+
 /**
  * Remove trailing assistant-role messages. OAuth endpoints reject requests
  * that end with an assistant turn (assistant prefill is not supported).
@@ -617,6 +743,8 @@ export function rewriteRequestBody(body: string): string {
   try {
     const parsed = JSON.parse(body)
     parsed.system = prependClaudeCodeIdentity(parsed.system)
+    repairOrphanedToolPairs(parsed)
+    stripUnsupportedEffortForHaiku(parsed)
     stripTrailingAssistantMessages(parsed)
     applyHybridCache1h(parsed)
     return prefixToolNames(parsed)

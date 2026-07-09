@@ -214,7 +214,9 @@ describe('auth.loader', () => {
     )
     expect(parsedBody.system[1].text).toBe('You are a helpful assistant.')
     // User message content normalised to block array with cache anchor
-    expect(parsedBody.messages[0].content[0].text).toBe('hello world test message')
+    expect(parsedBody.messages[0].content[0].text).toBe(
+      'hello world test message',
+    )
   })
 
   test('fetch wrapper refreshes expired token', async () => {
@@ -573,6 +575,138 @@ describe('auth.loader', () => {
     const sentBody = JSON.parse(tokenRequestBodies[0] ?? '{}')
     expect(sentBody.refresh_token).toBe('rotated-refresh-from-storage')
     expect(sentBody.refresh_token).not.toBe('stale-refresh')
+  })
+
+  test('fetch wrapper excludes interleaved-thinking beta for haiku models', async () => {
+    let capturedHeaders: Headers | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001' }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'interleaved-thinking-2025-05-14',
+    )
+  })
+
+  test('fetch wrapper retries a 429 response and returns eventual success', async () => {
+    let callCount = 0
+    const delays: number[] = []
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown, delay: number) => {
+      delays.push(delay)
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      if (callCount === 1) {
+        return Promise.resolve(
+          new Response(null, {
+            status: 429,
+            headers: { 'retry-after': '1' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(2)
+    expect(delays).toEqual([1000])
+    expect(response.status).toBe(200)
+  })
+
+  test('fetch wrapper gives up after max 429 retries and returns the 429 response', async () => {
+    let callCount = 0
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 429 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    // Initial attempt + MAX_429_RETRIES(3) retries = 4 calls total
+    expect(callCount).toBe(4)
+    expect(response.status).toBe(429)
+  })
+
+  test('fetch wrapper does not retry non-429 error statuses', async () => {
+    let callCount = 0
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 500 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(1)
+    expect(response.status).toBe(500)
   })
 
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {
