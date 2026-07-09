@@ -2,13 +2,17 @@ import type { Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange } from './auth.ts'
 import { CLIENT_ID, TOKEN_URL } from './constants.ts'
 import {
+  computeRetryAfterDelayMs,
   createStrippedStream,
+  extractModelId,
   isInsecure,
   mergeHeaders,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
 } from './transform.ts'
+
+const MAX_429_RETRIES = 3
 
 export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
   return {
@@ -140,22 +144,41 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               }
 
               const requestHeaders = mergeHeaders(input, init)
+              const rawBody = init?.body
+              const modelId =
+                typeof rawBody === 'string'
+                  ? extractModelId(rawBody)
+                  : undefined
               // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-              setOAuthHeaders(requestHeaders, auth.access!)
+              setOAuthHeaders(requestHeaders, auth.access!, modelId)
 
-              let body = init?.body
+              let body = rawBody
               if (body && typeof body === 'string') {
                 body = rewriteRequestBody(body)
               }
 
               const rewritten = rewriteUrl(input)
 
-              const response = await fetch(rewritten.input, {
-                ...init,
-                body,
-                headers: requestHeaders,
-                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              })
+              let response: Response
+              for (let attempt = 0; ; attempt++) {
+                response = await fetch(rewritten.input, {
+                  ...init,
+                  body,
+                  headers: requestHeaders,
+                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                })
+
+                if (response.status !== 429 || attempt >= MAX_429_RETRIES) {
+                  break
+                }
+
+                const delay = computeRetryAfterDelayMs(
+                  response.headers.get('retry-after'),
+                  attempt,
+                )
+                await response.body?.cancel()
+                await new Promise((resolve) => setTimeout(resolve, delay))
+              }
 
               return createStrippedStream(response)
             },

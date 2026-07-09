@@ -6,6 +6,7 @@ import {
   REQUIRED_BETAS,
 } from '../constants'
 import {
+  computeRetryAfterDelayMs,
   createStrippedStream,
   isInsecure,
   mergeBetaHeaders,
@@ -108,6 +109,29 @@ describe('mergeBetaHeaders', () => {
     const result = mergeBetaHeaders(headers)
     expect(result).toContain('beta-a')
     expect(result).toContain('beta-b')
+  })
+
+  test('excludes interleaved-thinking beta for haiku models', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers, 'claude-haiku-4-5-20251001')
+    expect(result).not.toContain('interleaved-thinking-2025-05-14')
+    for (const beta of REQUIRED_BETAS) {
+      if (beta !== 'interleaved-thinking-2025-05-14') {
+        expect(result).toContain(beta)
+      }
+    }
+  })
+
+  test('includes interleaved-thinking beta for non-haiku models', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers, 'claude-sonnet-5-20260630')
+    expect(result).toContain('interleaved-thinking-2025-05-14')
+  })
+
+  test('includes interleaved-thinking beta when model is unspecified', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers)
+    expect(result).toContain('interleaved-thinking-2025-05-14')
   })
 })
 
@@ -683,7 +707,13 @@ describe('rewriteRequestBody', () => {
             { type: 'text', text: 'Let me check' },
           ],
         },
-        { role: 'user', content: 'What did you find?' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+            { type: 'text', text: 'What did you find?' },
+          ],
+        },
       ],
       system: [
         { type: 'text', text: systemPrompt },
@@ -1572,5 +1602,156 @@ describe('createStrippedStream – tool prefix rewriting across chunk boundaries
 
     expect(text).toContain('"name": "bash"')
     expect(text).not.toContain('mcp_Bash')
+  })
+})
+
+describe('computeRetryAfterDelayMs', () => {
+  test('uses retry-after seconds value when present', () => {
+    expect(computeRetryAfterDelayMs('5', 0)).toBe(5000)
+  })
+
+  test('caps a large retry-after value', () => {
+    expect(computeRetryAfterDelayMs('120', 0)).toBe(30000)
+  })
+
+  test('falls back to exponential backoff when header is missing', () => {
+    expect(computeRetryAfterDelayMs(null, 0)).toBe(500)
+    expect(computeRetryAfterDelayMs(null, 1)).toBe(1000)
+  })
+
+  test('falls back to exponential backoff when header is invalid', () => {
+    expect(computeRetryAfterDelayMs('not-a-number', 0)).toBe(500)
+  })
+
+  test('caps exponential backoff too', () => {
+    expect(computeRetryAfterDelayMs(null, 10)).toBe(30000)
+  })
+})
+
+describe('stripUnsupportedEffortForHaiku', () => {
+  test('strips output_config.effort for haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toBeUndefined()
+  })
+
+  test('strips thinking.effort but keeps other thinking fields for haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'enabled' })
+  })
+
+  test('removes thinking object entirely when effort was its only field', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toBeUndefined()
+  })
+
+  test('keeps output_config.effort and thinking.effort untouched for non-haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5-20260630',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'high' },
+      thinking: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'high' })
+    expect(result.thinking).toEqual({ effort: 'high' })
+  })
+})
+
+describe('repairOrphanedToolPairs', () => {
+  test('drops a tool_result with no matching tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'missing_1', content: 'ok' },
+            { type: 'text', text: 'hello' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].text).toBe('hello')
+  })
+
+  test('drops a tool_use with no matching tool_result', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+            { type: 'text', text: 'checking' },
+          ],
+        },
+        { role: 'user', content: 'follow up' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].text).toBe('checking')
+  })
+
+  test('keeps matched tool_use/tool_result pairs untouched', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[1].content).toHaveLength(1)
+    expect(result.messages[1].content[0].type).toBe('tool_result')
+  })
+
+  test('drops a message entirely when all its content blocks are orphaned', () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'orphan', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'still there?' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].text).toBe('hi')
+    expect(result.messages[1].content[0].text).toBe('still there?')
   })
 })
