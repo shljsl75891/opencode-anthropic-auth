@@ -1661,7 +1661,7 @@ describe('stripUnsupportedEffortForHaiku', () => {
 
   test('keeps output_config.effort and thinking.effort untouched for non-haiku models', () => {
     const body = JSON.stringify({
-      model: 'claude-sonnet-5-20260630',
+      model: 'claude-sonnet-4-6-20260101',
       messages: [{ role: 'user', content: 'hi' }],
       output_config: { effort: 'high' },
       thinking: { effort: 'high' },
@@ -1669,6 +1669,115 @@ describe('stripUnsupportedEffortForHaiku', () => {
     const result = JSON.parse(rewriteRequestBody(body))
     expect(result.output_config).toEqual({ effort: 'high' })
     expect(result.thinking).toEqual({ effort: 'high' })
+  })
+})
+
+describe('normalizeAdaptiveThinking', () => {
+  test('defaults thinking to adaptive + summarized on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('converts legacy enabled+budget_tokens thinking to adaptive', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('canonicalizes disabled thinking to a bare object, stripping display', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled', display: 'summarized' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('demotes xhigh/max effort to high when thinking is disabled', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'xhigh' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('leaves max effort untouched when thinking is disabled but effort is already low', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'low' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'low' })
+  })
+
+  test('does not touch thinking on non-adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 })
+  })
+})
+
+describe('stripRestrictedSamplingParams', () => {
+  test('strips non-default temperature on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 0.7,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBeUndefined()
+  })
+
+  test('keeps temperature 1 (the default) on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 1,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBe(1)
+  })
+
+  test('strips top_p and top_k on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      top_p: 0.9,
+      top_k: 40,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.top_p).toBeUndefined()
+    expect(result.top_k).toBeUndefined()
+  })
+
+  test('leaves sampling params untouched on non-adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 0.7,
+      top_p: 0.9,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBe(0.7)
+    expect(result.top_p).toBe(0.9)
   })
 })
 
@@ -1753,5 +1862,106 @@ describe('repairOrphanedToolPairs', () => {
     expect(result.messages).toHaveLength(2)
     expect(result.messages[0].content[0].text).toBe('hi')
     expect(result.messages[1].content[0].text).toBe('still there?')
+  })
+
+  test('drops a tool_use whose tool_result is not in the immediately following message', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'a /compact summary was inserted here' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].content[0].text).toBe(
+      'a /compact summary was inserted here',
+    )
+  })
+
+  test('keeps only the adjacent tool_result when results are split across multiple following messages', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'first' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'second' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[1].content[0].content).toBe('first')
+  })
+
+  test('drops a reversed pair where tool_result precedes its tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(0)
+  })
+
+  test('moves tool_result blocks before text blocks within the same message', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'here is the result' },
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[1].content[0].type).toBe('tool_result')
+    expect(result.messages[1].content[1].type).toBe('text')
   })
 })

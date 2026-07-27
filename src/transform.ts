@@ -1,4 +1,5 @@
 import {
+  ADAPTIVE_THINKING_MODEL_PATTERN,
   ANTHROPIC_CACHE_LOOKBACK_BLOCKS,
   CLAUDE_CODE_IDENTITY,
   OPENCODE_IDENTITY_PREFIX,
@@ -61,8 +62,8 @@ export function mergeHeaders(input: FetchInput, init?: RequestInit): Headers {
 }
 
 /**
- * Anthropic rejects interleaved-thinking on Haiku models — this checks
- * whether a model id refers to a Haiku model.
+ * Haiku models don't support interleaved thinking — checks whether a model
+ * id refers to a Haiku model.
  */
 function isHaikuModel(modelId: string | undefined): boolean {
   return /haiku/i.test(modelId ?? '')
@@ -70,8 +71,8 @@ function isHaikuModel(modelId: string | undefined): boolean {
 
 /**
  * Merge incoming beta headers with the required OAuth betas, deduplicating.
- * Excludes betas unsupported by the target model (e.g. interleaved-thinking
- * on Haiku models).
+ * Excludes betas that are no-ops on the target model (e.g. interleaved-thinking
+ * on Haiku models, which don't support it).
  */
 export function mergeBetaHeaders(headers: Headers, modelId?: string): string {
   const incomingBeta = headers.get('anthropic-beta') || ''
@@ -559,47 +560,106 @@ function stripUnsupportedEffortForHaiku(parsed: Record<string, unknown>): void {
   }
 }
 
+const ADAPTIVE_THINKING_DEFAULT = { type: 'adaptive', display: 'summarized' }
+
 /**
- * Remove tool_use blocks with no matching tool_result, and tool_result
- * blocks that reference a non-existent tool_use. Anthropic rejects requests
- * with unpaired tool_use/tool_result blocks — this can happen when OpenCode
- * truncates or reconstructs conversation history after an interruption.
+ * Adaptive-thinking models (Opus 5, Sonnet 5, …) default to hidden thinking
+ * and reject legacy manual `thinking.type: "enabled"` + budget_tokens (400
+ * on 4.7+). Normalizes to adaptive+summarized, canonicalizes disabled
+ * thinking to a bare object (extra fields 400), and demotes xhigh/max
+ * effort to high when thinking is disabled (that combination always 400s).
+ */
+function normalizeAdaptiveThinking(parsed: Record<string, unknown>): void {
+  if (!ADAPTIVE_THINKING_MODEL_PATTERN.test(String(parsed.model ?? ''))) return
+
+  const thinking = parsed.thinking
+  if (isRecord(thinking) && thinking.type === 'disabled') {
+    parsed.thinking = { type: 'disabled' }
+
+    const outputConfig = parsed.output_config
+    if (
+      isRecord(outputConfig) &&
+      (outputConfig.effort === 'xhigh' || outputConfig.effort === 'max')
+    ) {
+      outputConfig.effort = 'high'
+    }
+    return
+  }
+
+  parsed.thinking = { ...ADAPTIVE_THINKING_DEFAULT }
+}
+
+/**
+ * Adaptive-thinking models reject non-default temperature/top_p/top_k with
+ * a 400, regardless of whether thinking is enabled. Anthropic's default
+ * temperature is 1 — anything else is non-default and must be stripped.
+ * top_p/top_k have no usable default on these models, so always stripped.
+ */
+function stripRestrictedSamplingParams(parsed: Record<string, unknown>): void {
+  if (!ADAPTIVE_THINKING_MODEL_PATTERN.test(String(parsed.model ?? ''))) return
+
+  if (parsed.temperature !== undefined && parsed.temperature !== 1) {
+    delete parsed.temperature
+  }
+  delete parsed.top_p
+  delete parsed.top_k
+}
+
+/**
+ * Remove tool_use/tool_result blocks that are not adjacent pairs. Anthropic
+ * requires a tool_result to be the first content in the message immediately
+ * following its tool_use — a summary inserted by /undo or /compact can leave
+ * the ids matched but no longer adjacent, which the API rejects with a 400.
  * Messages left with no content blocks are dropped entirely.
  */
 function repairOrphanedToolPairs(parsed: Record<string, unknown>): void {
   if (!Array.isArray(parsed.messages)) return
+  const messages = parsed.messages
 
-  const toolUseIds = new Set<string>()
-  const toolResultIds = new Set<string>()
+  const useMsgIndex = new Map<string, number>()
+  const resultMsgIndex = new Map<string, number>()
 
-  for (const msg of parsed.messages) {
-    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+  messages.forEach((msg, index) => {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) return
     for (const block of msg.content) {
       if (!isRecord(block)) continue
-      if (block.type === 'tool_use' && typeof block.id === 'string') {
-        toolUseIds.add(block.id)
+      if (
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        !useMsgIndex.has(block.id)
+      ) {
+        useMsgIndex.set(block.id, index)
       } else if (
         block.type === 'tool_result' &&
-        typeof block.tool_use_id === 'string'
+        typeof block.tool_use_id === 'string' &&
+        !resultMsgIndex.has(block.tool_use_id)
       ) {
-        toolResultIds.add(block.tool_use_id)
+        resultMsgIndex.set(block.tool_use_id, index)
       }
     }
+  })
+
+  const isAdjacentPair = (id: string): boolean => {
+    const useIndex = useMsgIndex.get(id)
+    return useIndex !== undefined && resultMsgIndex.get(id) === useIndex + 1
   }
 
-  parsed.messages = parsed.messages.filter((msg) => {
+  parsed.messages = messages.filter((msg, index) => {
     if (!isRecord(msg) || !Array.isArray(msg.content)) return true
 
     const filteredContent = msg.content.filter((block) => {
       if (!isRecord(block)) return true
       if (block.type === 'tool_use' && typeof block.id === 'string') {
-        return toolResultIds.has(block.id)
+        return isAdjacentPair(block.id) && useMsgIndex.get(block.id) === index
       }
       if (
         block.type === 'tool_result' &&
         typeof block.tool_use_id === 'string'
       ) {
-        return toolUseIds.has(block.tool_use_id)
+        return (
+          isAdjacentPair(block.tool_use_id) &&
+          resultMsgIndex.get(block.tool_use_id) === index
+        )
       }
       return true
     })
@@ -610,8 +670,32 @@ function repairOrphanedToolPairs(parsed: Record<string, unknown>): void {
 }
 
 /**
- * Remove trailing assistant-role messages. OAuth endpoints reject requests
- * that end with an assistant turn (assistant prefill is not supported).
+ * Anthropic requires tool_result blocks to precede any text in a message
+ * (text-before-tool_result is a 400). Reorder in place when both are present.
+ */
+function reorderToolResultBlocks(parsed: Record<string, unknown>): void {
+  if (!Array.isArray(parsed.messages)) return
+  for (const msg of parsed.messages) {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+    const hasToolResult = msg.content.some(
+      (block) => isRecord(block) && block.type === 'tool_result',
+    )
+    if (!hasToolResult) continue
+
+    const results = msg.content.filter(
+      (block) => isRecord(block) && block.type === 'tool_result',
+    )
+    const rest = msg.content.filter(
+      (block) => !(isRecord(block) && block.type === 'tool_result'),
+    )
+    msg.content = [...results, ...rest]
+  }
+}
+
+/**
+ * Remove trailing assistant-role messages. Claude 4.6+ models reject
+ * requests that end with an assistant turn (assistant prefill is not
+ * supported on these model generations).
  */
 function stripTrailingAssistantMessages(parsed: Record<string, unknown>): void {
   if (!Array.isArray(parsed.messages)) return
@@ -744,6 +828,9 @@ export function rewriteRequestBody(body: string): string {
     const parsed = JSON.parse(body)
     parsed.system = prependClaudeCodeIdentity(parsed.system)
     repairOrphanedToolPairs(parsed)
+    reorderToolResultBlocks(parsed)
+    normalizeAdaptiveThinking(parsed)
+    stripRestrictedSamplingParams(parsed)
     stripUnsupportedEffortForHaiku(parsed)
     stripTrailingAssistantMessages(parsed)
     applyHybridCache1h(parsed)

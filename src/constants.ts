@@ -35,12 +35,22 @@ export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
-  'fine-grained-tool-streaming-2025-05-14',
 ]
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =
-  "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+  "You are Claude Code, Anthropic's official CLI for Claude."
+
+/**
+ * Model families with adaptive thinking (thinking defaults on, display
+ * defaults to "omitted"). These models reject legacy manual thinking
+ * (type: enabled + budget_tokens) and non-default temperature/top_p/top_k.
+ */
+export const ADAPTIVE_THINKING_MODEL_PATTERN =
+  /claude-(opus-5|opus-4-8|opus-4-7|sonnet-5|fable-5|mythos-5)/i
+
+/** Proactive OAuth refresh margin — refresh this long before actual expiry. */
+export const OAUTH_REFRESH_SKEW_MS = 5 * 60_000
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
