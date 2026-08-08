@@ -22,6 +22,13 @@ export const OAUTH_SCOPES = [
 export const TOOL_PREFIX = 'mcp_'
 
 /**
+ * Content for a synthesized tool_result whose real output was removed by a
+ * /compact or /undo summary insertion (see repairOrphanedToolPairs).
+ */
+export const TOOL_RESULT_PLACEHOLDER =
+  'Tool result unavailable (removed during context compaction).'
+
+/**
  * Anthropic's cache lookback window size. Each explicit breakpoint scans at
  * most this many content blocks backward (counting the breakpoint block as
  * position 1, across all roles and types — text, thinking, tool_use,

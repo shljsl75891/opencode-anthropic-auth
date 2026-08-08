@@ -1,5 +1,19 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.6.0
+
+### Minor Changes
+
+- add latest recommended approaches, and add inspired plugin new releases additions
+
+### Patch Changes
+
+- **Preserve thinking blocks when repairing orphaned tool_use/tool_result pairs** (inspired by
+  griffinmartin/opencode-claude-auth): after `/compact` or `/undo`, orphaned `tool_use` blocks are no
+  longer dropped from the latest assistant message — dropping them alongside a `thinking` block
+  triggered Anthropic's "thinking blocks... cannot be modified" 400. Instead, a placeholder
+  `tool_result` is synthesized to restore adjacency, and assistant message content is never rewritten.
+
 ## 2.4.0
 
 ### Minor Changes

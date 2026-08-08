@@ -1800,7 +1800,40 @@ describe('repairOrphanedToolPairs', () => {
     expect(result.messages[0].content[0].text).toBe('hello')
   })
 
-  test('drops a tool_use with no matching tool_result', () => {
+  test('preserves thinking blocks in the latest assistant message when its tool_use is orphaned', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'reasoning...', signature: 'sig' },
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'a /compact summary was inserted here' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('thinking')
+    expect(result.messages[0].content[0].thinking).toBe('reasoning...')
+    expect(result.messages[0].content[1].type).toBe('tool_use')
+    expect(result.messages[0].content[1].id).toBe('tool_1')
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'tool_result',
+      tool_use_id: 'tool_1',
+      content: 'Tool result unavailable (removed during context compaction).',
+      is_error: true,
+    })
+    expect(result.messages[1].content[1].type).toBe('text')
+    expect(result.messages[1].content[1].text).toBe(
+      'a /compact summary was inserted here',
+    )
+  })
+
+  test('synthesizes a placeholder tool_result for an orphaned tool_use', () => {
     const body = JSON.stringify({
       messages: [
         {
@@ -1815,8 +1848,17 @@ describe('repairOrphanedToolPairs', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    expect(result.messages[0].content).toHaveLength(1)
-    expect(result.messages[0].content[0].text).toBe('checking')
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[0].content[1].text).toBe('checking')
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'tool_result',
+      tool_use_id: 'tool_1',
+      content: 'Tool result unavailable (removed during context compaction).',
+      is_error: true,
+    })
+    expect(result.messages[1].content[1].text).toBe('follow up')
   })
 
   test('keeps matched tool_use/tool_result pairs untouched', () => {
@@ -1844,7 +1886,7 @@ describe('repairOrphanedToolPairs', () => {
     expect(result.messages[1].content[0].type).toBe('tool_result')
   })
 
-  test('drops a message entirely when all its content blocks are orphaned', () => {
+  test('inserts a synthetic result rather than dropping an orphaned tool_use message', () => {
     const body = JSON.stringify({
       messages: [
         { role: 'user', content: 'hi' },
@@ -1859,12 +1901,15 @@ describe('repairOrphanedToolPairs', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    expect(result.messages).toHaveLength(2)
+    expect(result.messages).toHaveLength(3)
     expect(result.messages[0].content[0].text).toBe('hi')
-    expect(result.messages[1].content[0].text).toBe('still there?')
+    expect(result.messages[1].content[0].type).toBe('tool_use')
+    expect(result.messages[1].content[0].id).toBe('orphan')
+    expect(result.messages[2].content[0].tool_use_id).toBe('orphan')
+    expect(result.messages[2].content[1].text).toBe('still there?')
   })
 
-  test('drops a tool_use whose tool_result is not in the immediately following message', () => {
+  test('synthesizes an adjacent result when /compact splits a tool_use from its tool_result', () => {
     const body = JSON.stringify({
       messages: [
         {
@@ -1884,8 +1929,11 @@ describe('repairOrphanedToolPairs', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    expect(result.messages).toHaveLength(1)
-    expect(result.messages[0].content[0].text).toBe(
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[1].content[0].tool_use_id).toBe('tool_1')
+    expect(result.messages[1].content[1].text).toBe(
       'a /compact summary was inserted here',
     )
   })
@@ -1919,7 +1967,7 @@ describe('repairOrphanedToolPairs', () => {
     expect(result.messages[1].content[0].content).toBe('first')
   })
 
-  test('drops a reversed pair where tool_result precedes its tool_use', () => {
+  test('drops the leading orphaned tool_result then synthesizes a result for the reversed tool_use', () => {
     const body = JSON.stringify({
       messages: [
         {
@@ -1938,7 +1986,10 @@ describe('repairOrphanedToolPairs', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    expect(result.messages).toHaveLength(0)
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[1].content[0].tool_use_id).toBe('tool_1')
   })
 
   test('moves tool_result blocks before text blocks within the same message', () => {

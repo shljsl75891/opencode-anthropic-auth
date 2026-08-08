@@ -40,6 +40,7 @@ Additional behaviours:
 
 - **System tail coalescing** — plugin-added system blocks beyond the primary prompt are merged into one block before placing the system anchor, preventing cache busts when block layout changes between requests
 - **Trailing assistant strip** — assistant messages at the tail of the request are removed before forwarding (OAuth rejects assistant prefill)
+- **Tool pair repair** — `/compact` and `/undo` can leave a `tool_use` and its `tool_result` matched by id but no longer adjacent. Orphaned `tool_result` blocks are dropped; orphaned `tool_use` blocks are never deleted (Anthropic rejects edits to `thinking`/`redacted_thinking` blocks in the latest assistant message) — instead a placeholder `tool_result` is synthesized to restore adjacency
 - **Thinking block guard** — `thinking` and `redacted_thinking` blocks are excluded from cache anchor placement; messages containing only thinking blocks receive no `cache_control` (avoids Anthropic 400)
 - **SSE retryable errors** — transient server errors (`api_error`, `overloaded_error`, `server_error`) emitted inside HTTP 200 streams are detected and thrown as connection-reset errors so OpenCode auto-retries
 - **Buffered stream rewriting** — tool name stripping buffers partial `"name"` tokens across chunk boundaries to avoid corruption

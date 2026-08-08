@@ -7,6 +7,7 @@ import {
   REQUIRED_BETAS,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
+  TOOL_RESULT_PLACEHOLDER,
   USER_AGENT,
 } from './constants.ts'
 
@@ -605,68 +606,113 @@ function stripRestrictedSamplingParams(parsed: Record<string, unknown>): void {
   delete parsed.top_k
 }
 
+function toolUseIdOf(block: unknown): string | undefined {
+  return isRecord(block) &&
+    block.type === 'tool_use' &&
+    typeof block.id === 'string'
+    ? block.id
+    : undefined
+}
+
+function toolResultIdOf(block: unknown): string | undefined {
+  return isRecord(block) &&
+    block.type === 'tool_result' &&
+    typeof block.tool_use_id === 'string'
+    ? block.tool_use_id
+    : undefined
+}
+
 /**
- * Remove tool_use/tool_result blocks that are not adjacent pairs. Anthropic
- * requires a tool_result to be the first content in the message immediately
- * following its tool_use — a summary inserted by /undo or /compact can leave
- * the ids matched but no longer adjacent, which the API rejects with a 400.
- * Messages left with no content blocks are dropped entirely.
+ * Reconcile tool_use/tool_result adjacency broken by a /compact or /undo
+ * summary insertion. Anthropic requires a tool_result to be the first
+ * content in the message immediately following its tool_use, and rejects
+ * partial edits to an assistant message that holds thinking/redacted_thinking
+ * blocks ("thinking blocks in the latest assistant message cannot be
+ * modified") — so orphaned tool_use blocks can't simply be deleted. Two
+ * passes:
+ *
+ *  1. Remove tool_result blocks with no adjacent preceding tool_use (these
+ *     only live in user turns, so no thinking block is affected).
+ *  2. Synthesize a placeholder tool_result, adjacent, for every tool_use
+ *     that still lacks one — assistant message content is never rewritten.
  */
 function repairOrphanedToolPairs(parsed: Record<string, unknown>): void {
   if (!Array.isArray(parsed.messages)) return
   const messages = parsed.messages
 
-  const useMsgIndex = new Map<string, number>()
-  const resultMsgIndex = new Map<string, number>()
-
-  messages.forEach((msg, index) => {
-    if (!isRecord(msg) || !Array.isArray(msg.content)) return
-    for (const block of msg.content) {
-      if (!isRecord(block)) continue
-      if (
-        block.type === 'tool_use' &&
-        typeof block.id === 'string' &&
-        !useMsgIndex.has(block.id)
-      ) {
-        useMsgIndex.set(block.id, index)
-      } else if (
-        block.type === 'tool_result' &&
-        typeof block.tool_use_id === 'string' &&
-        !resultMsgIndex.has(block.tool_use_id)
-      ) {
-        resultMsgIndex.set(block.tool_use_id, index)
-      }
-    }
-  })
-
-  const isAdjacentPair = (id: string): boolean => {
-    const useIndex = useMsgIndex.get(id)
-    return useIndex !== undefined && resultMsgIndex.get(id) === useIndex + 1
+  const hasAdjacentUse = (index: number, id: string): boolean => {
+    const prev = messages[index - 1]
+    return (
+      isRecord(prev) &&
+      Array.isArray(prev.content) &&
+      prev.content.some((block) => toolUseIdOf(block) === id)
+    )
   }
 
-  parsed.messages = messages.filter((msg, index) => {
-    if (!isRecord(msg) || !Array.isArray(msg.content)) return true
-
-    const filteredContent = msg.content.filter((block) => {
-      if (!isRecord(block)) return true
-      if (block.type === 'tool_use' && typeof block.id === 'string') {
-        return isAdjacentPair(block.id) && useMsgIndex.get(block.id) === index
-      }
-      if (
-        block.type === 'tool_result' &&
-        typeof block.tool_use_id === 'string'
-      ) {
-        return (
-          isAdjacentPair(block.tool_use_id) &&
-          resultMsgIndex.get(block.tool_use_id) === index
-        )
-      }
-      return true
+  const pass1 = messages.flatMap((msg, index) => {
+    if (!isRecord(msg) || !Array.isArray(msg.content)) return [msg]
+    const filtered = msg.content.filter((block) => {
+      const resultId = toolResultIdOf(block)
+      return resultId === undefined || hasAdjacentUse(index, resultId)
     })
-    msg.content = filteredContent
-
-    return filteredContent.length > 0
+    if (filtered.length === 0 && msg.content.length > 0) return []
+    return [
+      filtered.length === msg.content.length
+        ? msg
+        : { ...msg, content: filtered },
+    ]
   })
+
+  const out: unknown[] = []
+  for (let i = 0; i < pass1.length; i++) {
+    const msg = pass1[i]
+    out.push(msg)
+    if (!isRecord(msg) || !Array.isArray(msg.content)) continue
+
+    const useIds = msg.content
+      .map(toolUseIdOf)
+      .filter((id): id is string => id !== undefined)
+    if (useIds.length === 0) continue
+
+    const next = pass1[i + 1]
+    const presentIds = new Set(
+      isRecord(next) && Array.isArray(next.content)
+        ? next.content
+            .map(toolResultIdOf)
+            .filter((id): id is string => id !== undefined)
+        : [],
+    )
+    const missing = useIds.filter((id) => !presentIds.has(id))
+    if (missing.length === 0) continue
+
+    const synthetic = missing.map((id) => ({
+      type: 'tool_result',
+      tool_use_id: id,
+      content: TOOL_RESULT_PLACEHOLDER,
+      is_error: true,
+    }))
+
+    if (isRecord(next) && next.role === 'user' && Array.isArray(next.content)) {
+      out.push({ ...next, content: [...synthetic, ...next.content] })
+      i++
+    } else if (
+      isRecord(next) &&
+      next.role === 'user' &&
+      typeof next.content === 'string'
+    ) {
+      const text = next.content
+      out.push({
+        ...next,
+        content:
+          text.length > 0 ? [...synthetic, { type: 'text', text }] : synthetic,
+      })
+      i++
+    } else {
+      out.push({ role: 'user', content: synthetic })
+    }
+  }
+
+  parsed.messages = out
 }
 
 /**
