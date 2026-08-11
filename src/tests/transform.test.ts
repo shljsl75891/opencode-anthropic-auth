@@ -162,6 +162,20 @@ describe('setOAuthHeaders', () => {
       expect(headers.get('anthropic-beta')).toContain(beta)
     }
   })
+
+  test('adds the server-side fallback beta only when the body opted in', () => {
+    const optedIn = new Headers()
+    setOAuthHeaders(optedIn, 'token', undefined, { fallbacks: 'default' })
+    expect(optedIn.get('anthropic-beta')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
+
+    const notOptedIn = new Headers()
+    setOAuthHeaders(notOptedIn, 'token')
+    expect(notOptedIn.get('anthropic-beta')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
+  })
 })
 
 describe('prefixToolNames', () => {
@@ -825,6 +839,100 @@ describe('rewriteRequestBody', () => {
     const result = JSON.parse(rewriteRequestBody(body))
 
     expect(result.context_management).toEqual(contextManagement)
+  })
+
+  test('strips trailing whitespace-only text after the latest assistant tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: '   \n  ' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+  })
+
+  test('preserves meaningful text after the latest assistant tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: 'checking now' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(2)
+    expect(result.messages[0].content[1].text).toBe('checking now')
+  })
+
+  test('opts a recoverable-refusal model into server-side fallback', () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.fallbacks).toBe('default')
+  })
+
+  test('does not opt an unrelated model into server-side fallback', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.fallbacks).toBeUndefined()
+  })
+
+  test('restores a hidden fallback marker before replaying the request', () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: '\u2060',
+              signature:
+                'opencode-anthropic-auth-server-fallback-v1:claude-fable-5|claude-opus-5',
+            },
+            { type: 'text', text: 'done' },
+          ],
+        },
+        { role: 'user', content: 'thanks' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'fallback',
+      from: { model: 'claude-fable-5' },
+      to: { model: 'claude-opus-5' },
+    })
   })
 })
 
@@ -1602,6 +1710,33 @@ describe('createStrippedStream – tool prefix rewriting across chunk boundaries
 
     expect(text).toContain('"name": "bash"')
     expect(text).not.toContain('mcp_Bash')
+  })
+})
+
+describe('createStrippedStream – server-side fallback', () => {
+  test('hides a fallback content block behind a signed marker', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-fable-5","usage":{}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-5"}}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks), {
+      serverFallbackModel: 'claude-fable-5',
+    })
+    const text = await stripped.text()
+
+    expect(text).not.toContain('"type":"fallback"')
+    expect(text).toContain('\u2060')
+  })
+
+  test('does not rewrite the stream when no fallback model is configured', async () => {
+    const chunks = [
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks))
+    const text = await stripped.text()
+
+    expect(text).toContain('"text":"hi"')
   })
 })
 

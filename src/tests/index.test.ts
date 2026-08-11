@@ -219,6 +219,123 @@ describe('auth.loader', () => {
     )
   })
 
+  test('fetch wrapper opts a recoverable-refusal model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBe('default')
+  })
+
+  test('fetch wrapper does not opt an unrelated model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBeUndefined()
+  })
+
+  test('fetch wrapper hides a fallback content block in a streamed response', async () => {
+    const encoder = new TextEncoder()
+    const responseStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-5"}}}\n\n',
+          ),
+        )
+        controller.close()
+      },
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(responseStream, { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).not.toContain('"type":"fallback"')
+    expect(text).toContain('\u2060')
+  })
+
   test('fetch wrapper refreshes expired token', async () => {
     const fetchCalls: Array<{ url: string; body?: string }> = []
 

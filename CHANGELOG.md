@@ -1,5 +1,20 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.7.0
+
+### Minor Changes
+
+- **Server-side safety fallback** (ported from cortexkit/anthropic-auth v1.19.0): OAuth requests for
+  `claude-fable-5`/`claude-opus-5` now opt into Anthropic's `fallbacks: "default"` server-side safety
+  fallback, so a content-filter refusal is transparently rerouted instead of returned as an error. The
+  returned `fallback` content block is hidden behind a signed `thinking` marker before being stored by
+  OpenCode, and restored on the next replay before the request is signed. Only affects the OAuth fetch
+  path — custom API-key routes are unaffected.
+
+- **Assistant prefill strip** (ported from cortexkit/anthropic-auth v1.19.0): trailing whitespace-only
+  text after the latest assistant `tool_use` is removed before replay, preventing a valid tool-result
+  continuation from being rejected as an unsupported assistant prefill.
+
 ## 2.6.0
 
 ### Minor Changes

@@ -10,6 +10,11 @@ import {
   TOOL_RESULT_PLACEHOLDER,
   USER_AGENT,
 } from './constants.ts'
+import {
+  applyServerSideFallbackToBody,
+  createServerSideFallbackStreamRewriter,
+  SERVER_SIDE_FALLBACK_BETA,
+} from './server-fallback.ts'
 
 function prefixName(name: string): string {
   return `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`
@@ -99,9 +104,19 @@ export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
   modelId?: string,
+  body?: unknown,
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
-  headers.set('anthropic-beta', mergeBetaHeaders(headers, modelId))
+  let beta = mergeBetaHeaders(headers, modelId)
+  if (isRecord(body) && body.fallbacks === 'default') {
+    beta = [
+      ...new Set([
+        ...beta.split(',').filter(Boolean),
+        SERVER_SIDE_FALLBACK_BETA,
+      ]),
+    ].join(',')
+  }
+  headers.set('anthropic-beta', beta)
   headers.set('user-agent', USER_AGENT)
   headers.delete('x-api-key')
   return headers
@@ -755,6 +770,43 @@ function stripTrailingAssistantMessages(parsed: Record<string, unknown>): void {
 }
 
 /**
+ * Anthropic can classify whitespace-only text after the latest assistant
+ * tool_use as assistant prefill on a later tool-result continuation, even
+ * though the request ends with a user turn. Strip it; preserve meaningful
+ * text and all earlier turns.
+ */
+function stripLatestAssistantToolUseTrailingWhitespace(
+  parsed: Record<string, unknown>,
+): void {
+  if (!Array.isArray(parsed.messages)) return
+
+  for (let index = parsed.messages.length - 1; index >= 0; index--) {
+    const message = parsed.messages[index]
+    if (!isRecord(message) || message.role !== 'assistant') continue
+    if (!Array.isArray(message.content)) return
+
+    const hasToolUse = message.content.some(
+      (block) => isRecord(block) && block.type === 'tool_use',
+    )
+    if (!hasToolUse) return
+
+    while (message.content.length) {
+      const block = message.content[message.content.length - 1]
+      if (
+        !isRecord(block) ||
+        block.type !== 'text' ||
+        typeof block.text !== 'string' ||
+        block.text.trim()
+      ) {
+        break
+      }
+      message.content.pop()
+    }
+    return
+  }
+}
+
+/**
  * Returns true when messages[0] carries a merged stable-prefix layout
  * (≥2 cacheable blocks). In that case anchoring the last block would bust
  * the cache every turn because the tail is volatile; instead we anchor
@@ -879,6 +931,8 @@ export function rewriteRequestBody(body: string): string {
     stripRestrictedSamplingParams(parsed)
     stripUnsupportedEffortForHaiku(parsed)
     stripTrailingAssistantMessages(parsed)
+    stripLatestAssistantToolUseTrailingWhitespace(parsed)
+    applyServerSideFallbackToBody(parsed)
     applyHybridCache1h(parsed)
     return prefixToolNames(parsed)
   } catch {
@@ -1069,7 +1123,10 @@ function splitToolPrefixRewriteBuffer(
  * Detects retryable Anthropic server errors inside HTTP 200 streams and
  * throws a connection-reset-style error so OpenCode can auto-retry.
  */
-export function createStrippedStream(response: Response): Response {
+export function createStrippedStream(
+  response: Response,
+  options?: { serverFallbackModel?: string },
+): Response {
   if (!response.body) return response
 
   const reader = response.body.getReader()
@@ -1078,6 +1135,9 @@ export function createStrippedStream(response: Response): Response {
   let pending = ''
   let readerReleased = false
   const sseErrors = createSseErrorState()
+  const fallbackRewriter = options?.serverFallbackModel
+    ? createServerSideFallbackStreamRewriter()
+    : undefined
 
   const releaseReader = () => {
     if (readerReleased) return
@@ -1091,7 +1151,9 @@ export function createStrippedStream(response: Response): Response {
         const { done, value } = await reader.read()
 
         if (done) {
-          const finalDecoded = decoder.decode()
+          const finalDecoded = fallbackRewriter
+            ? fallbackRewriter.push(decoder.decode()) + fallbackRewriter.flush()
+            : decoder.decode()
           let retryableError = updateSseErrorState(sseErrors, finalDecoded)
           if (!retryableError && sseErrors.pending) {
             retryableError = retryableAnthropicStreamErrorFromRawEvent(
@@ -1118,7 +1180,9 @@ export function createStrippedStream(response: Response): Response {
           return
         }
 
-        const decoded = decoder.decode(value, { stream: true })
+        const decoded = fallbackRewriter
+          ? fallbackRewriter.push(decoder.decode(value, { stream: true }))
+          : decoder.decode(value, { stream: true })
         const retryableError = updateSseErrorState(sseErrors, decoded)
         if (retryableError) {
           try {

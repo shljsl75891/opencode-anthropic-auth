@@ -1,6 +1,7 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange } from './auth.ts'
 import { CLIENT_ID, OAUTH_REFRESH_SKEW_MS, TOKEN_URL } from './constants.ts'
+import { isRecoverableRefusalModel } from './server-fallback.ts'
 import {
   computeRetryAfterDelayMs,
   createStrippedStream,
@@ -169,13 +170,23 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 typeof rawBody === 'string'
                   ? extractModelId(rawBody)
                   : undefined
-              // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-              setOAuthHeaders(requestHeaders, auth.access!, modelId)
 
               let body = rawBody
               if (body && typeof body === 'string') {
                 body = rewriteRequestBody(body)
               }
+
+              let parsedBody: unknown
+              if (typeof body === 'string') {
+                try {
+                  parsedBody = JSON.parse(body)
+                } catch {
+                  parsedBody = undefined
+                }
+              }
+
+              // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
+              setOAuthHeaders(requestHeaders, auth.access!, modelId, parsedBody)
 
               const rewritten = rewriteUrl(input)
 
@@ -203,7 +214,12 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   if (refreshed === accessToken) break
 
                   accessToken = refreshed
-                  setOAuthHeaders(requestHeaders, refreshed, modelId)
+                  setOAuthHeaders(
+                    requestHeaders,
+                    refreshed,
+                    modelId,
+                    parsedBody,
+                  )
                   continue
                 }
 
@@ -219,7 +235,10 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 await new Promise((resolve) => setTimeout(resolve, delay))
               }
 
-              return createStrippedStream(response)
+              const serverFallbackModel = isRecoverableRefusalModel(modelId)
+                ? modelId
+                : undefined
+              return createStrippedStream(response, { serverFallbackModel })
             },
           }
         }
