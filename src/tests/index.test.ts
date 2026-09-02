@@ -139,7 +139,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models },
     )
@@ -158,7 +158,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -183,7 +183,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'my-access-token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -207,15 +207,133 @@ describe('auth.loader', () => {
     const parsedBody = JSON.parse(capturedBody!)
     // Tool name should be prefixed
     expect(parsedBody.tools[0].name).toBe('mcp_Bash')
-    // Three-block layout: billing header, identity, rest
-    expect(parsedBody.system).toHaveLength(3)
-    expect(parsedBody.system[0].text).toContain('x-anthropic-billing-header')
-    expect(parsedBody.system[1].text).toBe(
-      "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    // Two-block layout: identity, rest (billing header removed in 1e03543)
+    expect(parsedBody.system).toHaveLength(2)
+    expect(parsedBody.system[0].text).toBe(
+      "You are Claude Code, Anthropic's official CLI for Claude.",
     )
-    expect(parsedBody.system[2].text).toBe('You are a helpful assistant.')
-    // User message is untouched
-    expect(parsedBody.messages[0].content).toBe('hello world test message')
+    expect(parsedBody.system[1].text).toBe('You are a helpful assistant.')
+    // User message content normalised to block array with cache anchor
+    expect(parsedBody.messages[0].content[0].text).toBe(
+      'hello world test message',
+    )
+  })
+
+  test('fetch wrapper opts a recoverable-refusal model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBe('default')
+  })
+
+  test('fetch wrapper does not opt an unrelated model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBeUndefined()
+  })
+
+  test('fetch wrapper hides a fallback content block in a streamed response', async () => {
+    const encoder = new TextEncoder()
+    const responseStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-5"}}}\n\n',
+          ),
+        )
+        controller.close()
+      },
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(responseStream, { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).not.toContain('"type":"fallback"')
+    expect(text).toContain('\u2060')
   })
 
   test('fetch wrapper refreshes expired token', async () => {
@@ -366,6 +484,69 @@ describe('auth.loader', () => {
     expect(tokenRefreshCalls).toBe(1)
   })
 
+  test('fetch wrapper honors Retry-After when the token endpoint returns 429', async () => {
+    let tokenRefreshCalls = 0
+    const delays: number[] = []
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown, delay: number) => {
+      delays.push(delay)
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+
+        if (tokenRefreshCalls === 1) {
+          return Promise.resolve(
+            new Response('Too Many Requests', {
+              status: 429,
+              headers: { 'retry-after': '2' },
+            }),
+          )
+        }
+
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired',
+          refresh: 'refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: '{}',
+    })
+
+    expect(tokenRefreshCalls).toBe(2)
+    expect(delays).toContain(2000)
+  })
+
   test('fetch wrapper strips tool prefix from streaming response', async () => {
     const encoder = new TextEncoder()
     const responseStream = new ReadableStream({
@@ -390,7 +571,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -576,6 +757,138 @@ describe('auth.loader', () => {
     expect(sentBody.refresh_token).not.toBe('stale-refresh')
   })
 
+  test('fetch wrapper excludes interleaved-thinking beta for haiku models', async () => {
+    let capturedHeaders: Headers | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001' }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'interleaved-thinking-2025-05-14',
+    )
+  })
+
+  test('fetch wrapper retries a 429 response and returns eventual success', async () => {
+    let callCount = 0
+    const delays: number[] = []
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown, delay: number) => {
+      delays.push(delay)
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      if (callCount === 1) {
+        return Promise.resolve(
+          new Response(null, {
+            status: 429,
+            headers: { 'retry-after': '1' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(2)
+    expect(delays).toEqual([1000])
+    expect(response.status).toBe(200)
+  })
+
+  test('fetch wrapper gives up after max 429 retries and returns the 429 response', async () => {
+    let callCount = 0
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 429 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    // Initial attempt + MAX_429_RETRIES(3) retries = 4 calls total
+    expect(callCount).toBe(4)
+    expect(response.status).toBe(429)
+  })
+
+  test('fetch wrapper does not retry non-429 error statuses', async () => {
+    let callCount = 0
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 500 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(1)
+    expect(response.status).toBe(500)
+  })
+
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {
     let capturedUrl: string | undefined
 
@@ -591,7 +904,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -602,5 +915,179 @@ describe('auth.loader', () => {
     })
 
     expect(capturedUrl).toContain('beta=true')
+  })
+
+  test('fetch wrapper proactively refreshes a token nearing expiry', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    const fetchCalls: string[] = []
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      fetchCalls.push(url)
+
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'still-valid-token',
+          refresh: 'old-refresh',
+          // Expires in 2 minutes — inside the 5-minute proactive skew window.
+          expires: Date.now() + 2 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(fetchCalls.some((url) => url.includes('/v1/oauth/token'))).toBe(true)
+    expect(mockClient.auth.set).toHaveBeenCalled()
+  })
+
+  test('fetch wrapper does not refresh a token outside the skew window', async () => {
+    const fetchCalls: string[] = []
+    globalThis.fetch = mock((input: any) => {
+      fetchCalls.push(extractUrl(input))
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          // Expires in 1 hour — well outside the 5-minute skew window.
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(fetchCalls.some((url) => url.includes('/v1/oauth/token'))).toBe(
+      false,
+    )
+  })
+
+  test('fetch wrapper forces a refresh and retries once on a 401 response', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    let messagesCallCount = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'refreshed-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      messagesCallCount += 1
+      if (messagesCallCount === 1) {
+        return Promise.resolve(new Response(null, { status: 401 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'stale-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(messagesCallCount).toBe(2)
+    expect(response.status).toBe(200)
+    expect(mockClient.auth.set).toHaveBeenCalled()
+  })
+
+  test('fetch wrapper does not loop on 401 when the refreshed token is unchanged', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    let messagesCallCount = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        // Refresh "succeeds" but returns the same access token (e.g. a
+        // revoked-grant edge case) — must not retry forever.
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'refresh',
+              access_token: 'stale-token',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      messagesCallCount += 1
+      return Promise.resolve(new Response(null, { status: 401 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'stale-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(messagesCallCount).toBe(1)
+    expect(response.status).toBe(401)
   })
 })
