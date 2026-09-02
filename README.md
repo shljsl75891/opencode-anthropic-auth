@@ -1,115 +1,58 @@
-# OpenCode Anthropic Auth Plugin
+# opencode-anthropic-auth
 
 > [!WARNING]
 > This plugin comes with no guarantees. You might be banned for breaking the TOS, you might not be. I don't work at Anthropic, nor am I an attorney.
 >
-> Use your best judgment and don't try to abuse the subscriptions. Plugins like oh-my-openagent are _known_ to trigger bans. Please be careful when using Ralph loops or insanely heavy usage patterns.
+> Use your best judgment and don't abuse your subscription.
 
-> [!IMPORTANT]
-> If you are seeing issues, please try to `rm -rf ~/.cache/opencode/packages/@ex-machina` and check your `opencode.json` config to make sure you're on the latest version.
->
-> Try this FIRST before making an Issue. Thanks!
+Fork of [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth), with caching improvements inspired by [cortexkit/anthropic-auth](https://github.com/cortexkit/anthropic-auth).
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
-## Usage
+## Install
 
-Add the plugin to your OpenCode configuration:
-
-```json
-{
-  "plugin": ["@ex-machina/opencode-anthropic-auth"]
-}
-```
-
-> [!TIP]
-> It is STRONGLY advised that you pin the plugin to a version. This will keep you from getting automatic updates; however, this will protect you from nefarious updates.
->
-> This holds true for ANY OpenCode plugin. If you do not pin them, OpenCode will automatically update them on startup. It's a massive vulnerability waiting to happen.
-
-#### Example of pinned version
+Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.8.2"]
+  "plugin": ["@sahiljassal/opencode-anthropic-auth"]
 }
 ```
 
 ## Authentication Methods
 
-The plugin provides three authentication options:
+- **Claude Pro/Max** — OAuth flow via `claude.ai`. Uses your existing subscription at no additional API cost.
+- **Create an API Key** — OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
+- **Manually enter API Key** — Standard API key entry.
 
-- **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
-    - run the `/connect` command, select `Anthropic (API key)` -> `Claude Pro/Max` and do OAuth
-- **Create an API Key** - OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
-- **Manually enter API Key** - Standard API key entry for users who already have one.
+## Prompt Caching
+
+This fork applies **hybrid 1-hour ephemeral prompt caching** on every request, placing up to 4 breakpoints strategically:
+
+| Breakpoint | Behaviour |
+|---|---|
+| **System anchor** | Last system block after the identity block (skipped when bridge occupies the slot) |
+| **messages[0]** | Magic-context split: anchors block[0] + block[1] when stable prefix and volatile delta are merged; otherwise anchors the last cacheable block |
+| **messages[1] / bridge** | Last cacheable block of messages[1]; replaced by a bridge anchor when the block count between two user anchors (counting ALL block types across every role) exceeds Anthropic's 20-block lookback window |
+| **Rolling latest** | Most recent user message beyond index 1, keeping cache hot across long sessions |
+
+Additional behaviours:
+
+- **System tail coalescing** — plugin-added system blocks beyond the primary prompt are merged into one block before placing the system anchor, preventing cache busts when block layout changes between requests
+- **Trailing assistant strip** — assistant messages at the tail of the request are removed before forwarding (OAuth rejects assistant prefill)
+- **Tool pair repair** — `/compact` and `/undo` can leave a `tool_use` and its `tool_result` matched by id but no longer adjacent. Orphaned `tool_result` blocks are dropped; orphaned `tool_use` blocks are never deleted (Anthropic rejects edits to `thinking`/`redacted_thinking` blocks in the latest assistant message) — instead a placeholder `tool_result` is synthesized to restore adjacency
+- **Assistant prefill strip** — trailing whitespace-only text after the latest assistant `tool_use` is removed before replay, so a valid tool-result continuation isn't rejected as an unsupported prefill
+- **Server-side safety fallback** — OAuth requests for `claude-fable-5`/`claude-opus-5` opt into Anthropic's `fallbacks: "default"` so a content-filter refusal is transparently rerouted instead of returned as an error. Since OpenCode has no concept of the returned `fallback` content block, it's hidden behind a signed marker on the way out and restored on the next replay before the request is sent. Only affects the OAuth fetch path — API-key auth is untouched
+- **Thinking block guard** — `thinking` and `redacted_thinking` blocks are excluded from cache anchor placement; messages containing only thinking blocks receive no `cache_control` (avoids Anthropic 400)
+- **SSE retryable errors** — transient server errors (`api_error`, `overloaded_error`, `server_error`) emitted inside HTTP 200 streams are detected and thrown as connection-reset errors so OpenCode auto-retries
+- **Buffered stream rewriting** — tool name stripping buffers partial `"name"` tokens across chunk boundaries to avoid corruption
 
 ## Configuration
 
-The plugin supports the following environment variables:
-
-| Variable                          | Description                                                                                                                                                                                 |
-|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
-| `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
-
-## How It Works
-
-For Claude Pro/Max authentication, the plugin:
-
-1. Initiates a PKCE OAuth flow against Anthropic's authorization endpoint
-2. Exchanges the authorization code for access and refresh tokens
-3. Automatically refreshes expired tokens
-4. Injects the required OAuth headers and beta flags into API requests
-5. Sanitizes the system prompt for compatibility (see below)
-6. Zeros out model costs (since usage is covered by the subscription)
-
-### System Prompt Sanitization
-
-The Anthropic API for Max subscriptions has specific requirements for the system prompt to identify as Claude Code. The plugin rewrites the system prompt on each request using an **anchor-based** approach that minimizes what gets changed:
-
-1. **Identity swap** — The OpenCode identity line is removed and replaced with the Claude Code identity.
-2. **Paragraph removal by anchor** — Any paragraph containing a known URL anchor (e.g. `github.com/anomalyco/opencode`, `opencode.ai/docs`) is removed entirely. This is resilient to upstream rewording — as long as the anchor URL appears somewhere in the paragraph, the removal works regardless of surrounding text changes.
-3. **Inline text replacements** — Short branded strings inside paragraphs we want to keep are replaced (e.g. "OpenCode" → "the assistant" in the professional objectivity section).
-
-Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The sanitized system prompt is structured as three blocks in `system[]`: the billing header, the Claude Code identity line, and the remaining system content.
-
-## Development
-
-### Local Testing
-
-Use `bun run dev` to test plugin changes locally without publishing to npm:
-
-```bash
-bun run dev
-```
-
-This does three things:
-
-1. Builds the plugin
-2. Symlinks the build output into `.opencode/plugins/` so OpenCode loads it as a local plugin
-3. Starts `tsc --watch` for automatic rebuilds on source changes
-
-After starting the dev script, restart OpenCode in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
-
-Ctrl+C stops the watcher and cleans up the symlink. If the process was killed without cleanup (e.g. `kill -9`), you can manually remove the symlink:
-
-```bash
-bun run dev:clean
-```
-
-> [!NOTE]
-> If you have the npm version of this plugin in your global OpenCode config, both will load. The local version takes precedence for auth handling.
-
-### Publishing
-
-This project uses [changesets](https://github.com/changesets/changesets) for versioning and publishing. See the [changeset README](.changeset/README.md) for more details.
-
-```bash
-bun change          # create a changeset describing your changes
-```
-
-When changesets are merged to `main`, CI will automatically open a release PR. Merging that PR publishes to npm.
+| Variable             | Description                                                                              |
+| -------------------- | ---------------------------------------------------------------------------------------- |
+| `ANTHROPIC_BASE_URL` | Override API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.              |
+| `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification. Only effective with `ANTHROPIC_BASE_URL`. |
 
 ## License
 
