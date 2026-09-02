@@ -1,5 +1,11 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.8.1
+
+### Patch Changes
+
+- Rebased onto upstream `ex-machina-co/opencode-anthropic-auth`, picking up `CLAUDE_CODE_VERSION` `2.1.258` (supersedes the fork's own `2.1.257` bump).
+
 ## 2.7.1
 
 ### Patch Changes
