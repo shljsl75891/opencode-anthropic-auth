@@ -7,11 +7,25 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./src/tui.tsx"
+    }
+  },
+  "oc-plugin": [
+    "server",
+    "tui"
+  ],
   "engines": {
     "bun": "1.3.14"
   },
   "files": [
-    "dist"
+    "dist",
+    "src/tui.tsx"
   ],
   "scripts": {
     "prepare": "tsc -p tsconfig.build.json",
@@ -29,6 +43,11 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.7",
+    "@opentui/solid": "0.5.7",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",

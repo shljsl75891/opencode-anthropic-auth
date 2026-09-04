@@ -1703,6 +1703,32 @@ describe('createStrippedStream – SSE retryable errors', () => {
     expect(err.code).toBe('ECONNRESET')
     expect(err.providerErrorType).toBe('api_error')
   })
+
+  test('throws on an error event delimited by bare CR line endings', async () => {
+    const errorEvent =
+      'event: error\rdata: {"type":"error","error":{"type":"api_error","message":"CR-delimited"}}\r\r'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('does not throw or hang on an oversized frame with no boundary', async () => {
+    const oversized = 'x'.repeat(1_048_577)
+    const validTail = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    const stripped = createStrippedStream(makeStream([oversized, validTail]))
+
+    const text = await stripped.text()
+    expect(text).toContain('message_stop')
+  })
 })
 
 describe('createStrippedStream – tool prefix rewriting across chunk boundaries', () => {

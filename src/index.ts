@@ -1,6 +1,8 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange } from './auth.ts'
 import { CLIENT_ID, OAUTH_REFRESH_SKEW_MS, TOKEN_URL } from './constants.ts'
+import { parseQuotaHeaders } from './quota-headers.ts'
+import { writeQuotaState } from './quota-state.ts'
 import { isRecoverableRefusalModel } from './server-fallback.ts'
 import {
   computeRetryAfterDelayMs,
@@ -233,6 +235,15 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 )
                 await response.body?.cancel()
                 await new Promise((resolve) => setTimeout(resolve, delay))
+              }
+
+              const quota = parseQuotaHeaders(response.headers)
+              if (quota) {
+                try {
+                  writeQuotaState(quota)
+                } catch {
+                  // Sidebar visibility is best-effort; never fail the request over it.
+                }
               }
 
               const serverFallbackModel = isRecoverableRefusalModel(modelId)

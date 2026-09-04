@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { AnthropicAuthPlugin } from '../index'
+import { readQuotaState } from '../quota-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -1089,5 +1093,78 @@ describe('auth.loader', () => {
 
     expect(messagesCallCount).toBe(1)
     expect(response.status).toBe(401)
+  })
+})
+
+describe('quota harvesting', () => {
+  const originalFetch = globalThis.fetch
+  let quotaFile: string
+  let originalEnv: string | undefined
+
+  beforeEach(() => {
+    globalThis.fetch = originalFetch
+    quotaFile = join(mkdtempSync(join(tmpdir(), 'quota-test-')), 'quota.json')
+    originalEnv = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE = quotaFile
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    if (originalEnv === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE = originalEnv
+    }
+  })
+
+  test('writes quota state from response headers', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(null, {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.5',
+            'anthropic-ratelimit-unified-5h-reset': '1893456000',
+          },
+        }),
+      ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(readQuotaState(quotaFile)?.fiveHour?.usedPercent).toBe(50)
+  })
+
+  test('does not throw when no quota headers are present', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).resolves.toBeDefined()
+    expect(readQuotaState(quotaFile)).toBeUndefined()
   })
 })

@@ -195,4 +195,40 @@ describe('createServerSideFallbackStreamRewriter', () => {
     const flushed = rewriter.push(finalFrame) + rewriter.flush()
     expect(flushed).toBe(finalFrame)
   })
+
+  test('rewrites a fallback block delimited by bare CR line endings', () => {
+    const rewriter = createServerSideFallbackStreamRewriter()
+
+    const messageStart = sseFrame('message_start', {
+      message: { model: 'claude-opus-5', usage: {} },
+    })
+    const data = JSON.stringify({
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'fallback',
+        from: { model: 'claude-fable-5' },
+        to: { model: 'claude-opus-5' },
+      },
+    })
+    const crFallbackBlockStart = `event: content_block_start\rdata: ${data}\r\r`
+
+    const out =
+      rewriter.push(messageStart) + rewriter.push(crFallbackBlockStart)
+
+    expect(out).not.toContain('"type":"fallback"')
+    expect(out).toContain('\u2060')
+    expect(out).toContain(
+      'opencode-anthropic-auth-server-fallback-v1:claude-fable-5|claude-opus-5',
+    )
+  })
+
+  test('flushes an oversized frame that never reaches a boundary', () => {
+    const rewriter = createServerSideFallbackStreamRewriter()
+
+    const oversized = 'x'.repeat(1_048_577)
+    const out = rewriter.push(oversized)
+
+    expect(out).toBe(oversized)
+  })
 })

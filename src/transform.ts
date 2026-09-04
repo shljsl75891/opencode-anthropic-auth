@@ -958,12 +958,22 @@ type SseErrorState = {
 function findSseBoundary(
   value: string,
 ): { index: number; length: number } | null {
+  const candidates: { index: number; length: number }[] = []
   const lf = value.indexOf('\n\n')
+  if (lf !== -1) candidates.push({ index: lf, length: 2 })
   const crlf = value.indexOf('\r\n\r\n')
-  if (lf === -1) return crlf === -1 ? null : { index: crlf, length: 4 }
-  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
-  return { index: crlf, length: 4 }
+  if (crlf !== -1) candidates.push({ index: crlf, length: 4 })
+  // Bare-CR event delimiter, seen from some proxies/relays that don't
+  // normalize old-Mac-style line endings.
+  const cr = value.indexOf('\r\r')
+  if (cr !== -1) candidates.push({ index: cr, length: 2 })
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => a.index - b.index || b.length - a.length)
+  return candidates[0] ?? null
 }
+
+// Bounds memory against a stream that never emits an SSE event boundary.
+const MAX_SSE_ERROR_SCAN_BYTES = 1_048_576
 
 function asDiagnosticRecord(
   value: unknown,
@@ -1018,7 +1028,7 @@ function retryableAnthropicStreamErrorFromRawEvent(
 
   let eventName: string | undefined
   const dataLines: string[] = []
-  for (const line of rawEvent.split(/\r?\n/)) {
+  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
     if (line.startsWith('event:')) {
       eventName = line.slice('event:'.length).trim()
     } else if (line.startsWith('data:')) {
@@ -1074,6 +1084,11 @@ function updateSseErrorState(
     const err = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
     if (err) return err
   }
+
+  // This buffer only scans for retryable error frames, so dropping it on
+  // a pathological non-terminating stream costs at most a missed
+  // detection, never corrupts the actual response content.
+  if (state.pending.length > MAX_SSE_ERROR_SCAN_BYTES) state.pending = ''
 
   return null
 }
