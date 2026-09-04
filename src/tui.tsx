@@ -1,14 +1,10 @@
-import {
-  fg as styledFg,
-  StyledText,
-  type TextRenderable,
-} from '@opentui/core'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
   TuiThemeCurrent,
 } from '@opencode-ai/plugin/tui'
+import { StyledText, fg as styledFg, type TextRenderable } from '@opentui/core'
 import {
   type Accessor,
   createEffect,

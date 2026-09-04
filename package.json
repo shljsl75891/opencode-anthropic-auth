@@ -21,7 +21,10 @@
   },
   "files": [
     "dist",
-    "src/tui.tsx"
+    "src/tui.tsx",
+    "src/quota-format.ts",
+    "src/quota-headers.ts",
+    "src/quota-state.ts"
   ],
   "scripts": {
     "prepare": "tsc -p tsconfig.build.json",
