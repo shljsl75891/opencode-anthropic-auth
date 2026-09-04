@@ -319,3 +319,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
+
+export default {
+  id: '@sahiljassal/opencode-anthropic-auth',
+  server: AnthropicAuthPlugin,
+}

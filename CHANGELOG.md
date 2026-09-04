@@ -1,5 +1,11 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 3.0.2
+
+### Patch Changes
+
+- Fix npm-installed plugin loading by exporting the OpenCode package-plugin module shape (`{ id, server }`). The previous named-only export worked as a legacy file-drop plugin but was ignored for package installs, causing OpenCode to fall back to native Anthropic API-key auth.
+
 ## 3.0.1
 
 ### Patch Changes

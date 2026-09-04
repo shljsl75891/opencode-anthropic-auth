@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AnthropicAuthPlugin } from '../index'
+import plugin, { AnthropicAuthPlugin } from '../index'
 import { readQuotaState } from '../quota-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -67,6 +67,11 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
 }
 
 describe('AnthropicAuthPlugin', () => {
+  test('exports a server plugin module for package loading', () => {
+    expect(plugin.id).toBe('@sahiljassal/opencode-anthropic-auth')
+    expect(plugin.server).toBe(AnthropicAuthPlugin)
+  })
+
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
     expect(plugin.auth).toBeDefined()
