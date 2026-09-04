@@ -3,7 +3,6 @@
   "globalDependencies": ["bun.lock", "mise.toml"],
   "globalPassThroughEnv": [
     "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_CLAUDE_CODE_VERSION",
     "ANTHROPIC_INSECURE",
     "OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE"
   ],
