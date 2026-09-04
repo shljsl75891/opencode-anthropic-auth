@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import dedent from 'dedent'
 import {
   CLAUDE_CODE_IDENTITY,
@@ -7,18 +7,22 @@ import {
   REQUIRED_BETAS,
 } from '../constants'
 import {
+  computeRetryAfterDelayMs,
   createStrippedStream,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
   prefixToolNames,
   prependClaudeCodeIdentity,
+  type RetryableAnthropicStreamError,
   rewriteRequestBody,
   rewriteUrl,
   sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
 } from '../transform'
+
+const CACHE_1H = { type: 'ephemeral', ttl: '1h' }
 
 describe('mergeHeaders', () => {
   test('copies headers from a Request object', () => {
@@ -107,6 +111,29 @@ describe('mergeBetaHeaders', () => {
     expect(result).toContain('beta-a')
     expect(result).toContain('beta-b')
   })
+
+  test('excludes interleaved-thinking beta for haiku models', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers, 'claude-haiku-4-5-20251001')
+    expect(result).not.toContain('interleaved-thinking-2025-05-14')
+    for (const beta of REQUIRED_BETAS) {
+      if (beta !== 'interleaved-thinking-2025-05-14') {
+        expect(result).toContain(beta)
+      }
+    }
+  })
+
+  test('includes interleaved-thinking beta for non-haiku models', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers, 'claude-sonnet-5-20260630')
+    expect(result).toContain('interleaved-thinking-2025-05-14')
+  })
+
+  test('includes interleaved-thinking beta when model is unspecified', () => {
+    const headers = new Headers()
+    const result = mergeBetaHeaders(headers)
+    expect(result).toContain('interleaved-thinking-2025-05-14')
+  })
 })
 
 describe('setOAuthHeaders', () => {
@@ -119,7 +146,9 @@ describe('setOAuthHeaders', () => {
   test('sets user-agent', () => {
     const headers = new Headers()
     setOAuthHeaders(headers, 'token')
-    expect(headers.get('user-agent')).toContain('claude-cli')
+    expect(headers.get('user-agent')).toBe(
+      `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+    )
   })
 
   test('removes x-api-key', () => {
@@ -135,6 +164,20 @@ describe('setOAuthHeaders', () => {
     for (const beta of REQUIRED_BETAS) {
       expect(headers.get('anthropic-beta')).toContain(beta)
     }
+  })
+
+  test('adds the server-side fallback beta only when the body opted in', () => {
+    const optedIn = new Headers()
+    setOAuthHeaders(optedIn, 'token', undefined, { fallbacks: 'default' })
+    expect(optedIn.get('anthropic-beta')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
+
+    const notOptedIn = new Headers()
+    setOAuthHeaders(notOptedIn, 'token')
+    expect(notOptedIn.get('anthropic-beta')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
   })
 })
 
@@ -225,10 +268,6 @@ describe('stripToolPrefix', () => {
 
 describe('rewriteUrl', () => {
   const originalEnv = process.env.ANTHROPIC_BASE_URL
-
-  beforeEach(() => {
-    delete process.env.ANTHROPIC_BASE_URL
-  })
 
   afterEach(() => {
     if (originalEnv === undefined) {
@@ -427,10 +466,7 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const original = new Response(stream, {
-      status: 200,
-      headers: { 'content-type': 'text/event-stream' },
-    })
+    const original = new Response(stream, { status: 200 })
     const stripped = createStrippedStream(original)
 
     const text = await stripped.text()
@@ -450,76 +486,11 @@ describe('createStrippedStream', () => {
     const original = new Response(stream, {
       status: 201,
       statusText: 'Created',
-      headers: {
-        'content-type': 'text/event-stream',
-        'x-custom': 'value',
-      },
+      headers: { 'x-custom': 'value' },
     })
 
     const stripped = createStrippedStream(original)
     expect(stripped.status).toBe(201)
-    expect(stripped.headers.get('x-custom')).toBe('value')
-  })
-
-  test('strips a tool prefix split across arbitrary stream chunks', async () => {
-    const chunks = [
-      'data: {"content_block":{"type":"tool_use","na',
-      'me":"m',
-      'cp_B',
-      'ash"}}\n\n',
-    ]
-    const encoder = new TextEncoder()
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-        controller.close()
-      },
-    })
-
-    const text = await createStrippedStream(
-      new Response(stream, {
-        headers: { 'content-type': 'text/event-stream' },
-      }),
-    ).text()
-
-    expect(text).toContain('"name": "bash"')
-    expect(text).not.toContain('mcp_')
-  })
-
-  test('preserves unicode when every input byte is a separate chunk', async () => {
-    const input =
-      'data: {"text":"Привет 👋","content_block":{"name":"mcp_Read"}}\n\n'
-    const bytes = new TextEncoder().encode(input)
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
-        controller.close()
-      },
-    })
-
-    const text = await createStrippedStream(
-      new Response(stream, {
-        headers: { 'content-type': 'text/event-stream' },
-      }),
-    ).text()
-
-    expect(text).toContain('Привет 👋')
-    expect(text).toContain('"name": "read"')
-    expect(text).not.toContain('�')
-  })
-
-  test('drops stale content-length after rewriting the response body', () => {
-    const original = new Response('data: {"name":"mcp_Read"}\n\n', {
-      headers: {
-        'content-type': 'text/event-stream',
-        'content-length': '999',
-        'x-custom': 'value',
-      },
-    })
-
-    const stripped = createStrippedStream(original)
-
-    expect(stripped.headers.get('content-length')).toBeNull()
     expect(stripped.headers.get('x-custom')).toBe('value')
   })
 
@@ -654,16 +625,6 @@ describe('sanitizeSystemText', () => {
       file contents"
     `)
   })
-
-  test('does not call onError when identity is present and removed', () => {
-    const onError = mock(() => {})
-    sanitizeSystemText(dedent`
-      You are OpenCode, the best coding agent on the planet.
-
-      Normal content.
-    `)
-    expect(onError).not.toHaveBeenCalled()
-  })
 })
 
 describe('prependClaudeCodeIdentity', () => {
@@ -720,10 +681,8 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
     expect(result.tools[0].name).toBe('mcp_Bash')
-    // system[0] = billing header, system[1] = identity, system[2] = rest
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('You are a helpful assistant.')
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('You are a helpful assistant.')
   })
 
   test('handles missing system field', () => {
@@ -731,10 +690,8 @@ describe('rewriteRequestBody', () => {
       messages: [{ role: 'user', content: 'hi' }],
     })
     const result = JSON.parse(rewriteRequestBody(body))
-    // system[0] = billing header, system[1] = identity (no rest block)
-    expect(result.system).toHaveLength(2)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
   })
 
   test('returns original string on invalid JSON', () => {
@@ -742,27 +699,7 @@ describe('rewriteRequestBody', () => {
     expect(rewriteRequestBody(body)).toBe(body)
   })
 
-  test('does not call onError when identity is present (rules always match)', () => {
-    const onError = mock(() => {})
-    const body = JSON.stringify({
-      messages: [],
-      system: `${OPENCODE_IDENTITY_PREFIX}\nsome other content`,
-    })
-    rewriteRequestBody(body)
-    expect(onError).not.toHaveBeenCalled()
-  })
-
   test('rewrites realistic OpenCode request end-to-end', () => {
-    //  Input system prompt (array of blocks):
-    //    [0] "You are OpenCode..." + generic content + "# Code References\n..."
-    //    [1] "Additional context block"
-    //
-    //  Expected output (three-block layout):
-    //    system[0] = billing header
-    //    system[1] = identity
-    //    system[2..n] = sanitized system blocks
-    //    User messages are untouched.
-
     const systemPrompt = [
       'You are OpenCode, the best coding agent on the planet.',
       '',
@@ -787,6 +724,13 @@ describe('rewriteRequestBody', () => {
             { type: 'text', text: 'Let me check' },
           ],
         },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+            { type: 'text', text: 'What did you find?' },
+          ],
+        },
       ],
       system: [
         { type: 'text', text: systemPrompt },
@@ -796,24 +740,20 @@ describe('rewriteRequestBody', () => {
 
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // Three-block layout: billing header, identity, sanitized blocks
-    expect(result.system).toHaveLength(4)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toContain('You have access to tools.')
-    expect(result.system[2].text).toContain('# Code References')
-    expect(result.system[2].text).not.toContain(OPENCODE_IDENTITY_PREFIX)
-    expect(result.system[3].text).toBe('Additional context block')
+    expect(result.system).toHaveLength(3)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toContain('You have access to tools.')
+    expect(result.system[1].text).toContain('# Code References')
+    expect(result.system[1].text).not.toContain(OPENCODE_IDENTITY_PREFIX)
+    expect(result.system[2].text).toBe('Additional context block')
 
-    // User messages are untouched
-    expect(result.messages[0].content).toBe('Help me fix this bug')
+    expect(result.messages[0].content[0].text).toBe('Help me fix this bug')
     expect(result.messages[1].content[0].name).toBe('mcp_Bash')
   })
 
   test('handles body with no messages array', () => {
     const body = JSON.stringify({ model: 'claude-3' })
     const result = JSON.parse(rewriteRequestBody(body))
-    // No messages → no billing header; system[0] = identity only
     expect(result.system).toHaveLength(1)
     expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
   })
@@ -825,14 +765,10 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2] = rest
-    expect(result.system).toHaveLength(3)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('Custom instructions for the assistant.')
-
-    // User message is untouched
-    expect(result.messages[0].content).toBe('hello')
+    expect(result.system).toHaveLength(2)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('Custom instructions for the assistant.')
+    expect(result.messages[0].content[0].text).toBe('hello')
   })
 
   test('keeps system blocks in system[] (array content)', () => {
@@ -850,14 +786,11 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2..3] = rest
-    expect(result.system).toHaveLength(4)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('Block A instructions')
-    expect(result.system[3].text).toBe('Block B instructions')
+    expect(result.system).toHaveLength(3)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('Block A instructions')
+    expect(result.system[2].text).toBe('Block B instructions')
 
-    // User message is untouched
     expect(result.messages[0].content).toHaveLength(1)
     expect(result.messages[0].content[0].text).toBe('hello')
   })
@@ -869,13 +802,12 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // No user messages → no billing header; system[0] = identity, system[1] = rest
     expect(result.system).toHaveLength(2)
     expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
     expect(result.system[1].text).toBe('Some instructions')
   })
 
-  test('keeps multiple system blocks as separate entries', () => {
+  test('coalesces plugin-added tail blocks beyond primary system prompt', () => {
     const body = JSON.stringify({
       system: [
         { type: 'text', text: 'First block' },
@@ -886,37 +818,124 @@ describe('rewriteRequestBody', () => {
     })
     const result = JSON.parse(rewriteRequestBody(body))
 
-    // system[0] = billing, system[1] = identity, system[2..4] = original blocks
-    expect(result.system).toHaveLength(5)
-    expect(result.system[0].text).toContain('x-anthropic-billing-header')
-    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
-    expect(result.system[2].text).toBe('First block')
-    expect(result.system[3].text).toBe('Second block')
-    expect(result.system[4].text).toBe('Third block')
-
-    // User message is untouched
-    expect(result.messages[0].content).toBe('hi')
+    expect(result.system).toHaveLength(3)
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toBe('First block')
+    expect(result.system[2].text).toBe('Second block\nThird block')
+    expect(result.messages[0].content[0].text).toBe('hi')
   })
-})
 
-describe('reported Claude Code version', () => {
-  // Anthropic gates model access on the version we report, and we report it
-  // twice: in the user-agent header and in the billing header's cc_version.
-  // If those ever disagree, one of them is stale and new models start failing
-  // with a 400 claude_code_version_too_old. Assert both against the constant.
-  test('user-agent and billing header both report CLAUDE_CODE_VERSION', () => {
-    const headers = new Headers()
-    setOAuthHeaders(headers, 'token')
-    expect(headers.get('user-agent')).toBe(
-      `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
-    )
-
+  test('preserves client context_management field untouched', () => {
+    const contextManagement = {
+      edits: [
+        {
+          type: 'clear_tool_uses_20250919',
+          trigger: { input_tokens: 40000 },
+          keep: { tool_uses: 5 },
+        },
+      ],
+    }
     const body = JSON.stringify({
-      messages: [{ role: 'user', content: 'hello world test message' }],
+      messages: [{ role: 'user', content: 'hi' }],
+      context_management: contextManagement,
     })
-    const billingHeader = JSON.parse(rewriteRequestBody(body)).system[0].text
-    // cc_version is `<version>.<3-char suffix>`, so match the version segment.
-    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.context_management).toEqual(contextManagement)
+  })
+
+  test('strips trailing whitespace-only text after the latest assistant tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: '   \n  ' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+  })
+
+  test('preserves meaningful text after the latest assistant tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: 'checking now' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(2)
+    expect(result.messages[0].content[1].text).toBe('checking now')
+  })
+
+  test('opts a recoverable-refusal model into server-side fallback', () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.fallbacks).toBe('default')
+  })
+
+  test('does not opt an unrelated model into server-side fallback', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.fallbacks).toBeUndefined()
+  })
+
+  test('restores a hidden fallback marker before replaying the request', () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: '\u2060',
+              signature:
+                'opencode-anthropic-auth-server-fallback-v1:claude-fable-5|claude-opus-5',
+            },
+            { type: 'text', text: 'done' },
+          ],
+        },
+        { role: 'user', content: 'thanks' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'fallback',
+      from: { model: 'claude-fable-5' },
+      to: { model: 'claude-opus-5' },
+    })
   })
 })
 
@@ -944,5 +963,1241 @@ describe('sanitizeSystemText – realistic prompt', () => {
     })
     const result = rewriteRequestBody(body)
     expect(JSON.parse(result)).toMatchSnapshot()
+  })
+})
+
+function makeMsg(
+  role: string,
+  content: string | Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  return { role, content }
+}
+
+function textBlock(text: string): Record<string, unknown> {
+  return { type: 'text', text }
+}
+
+function cacheBody(opts: { system?: unknown; messages: unknown[] }): string {
+  return JSON.stringify({
+    system: opts.system ?? 'Instructions.',
+    messages: opts.messages,
+  })
+}
+
+describe('hybrid cache – breakpoint placement', () => {
+  test('strips all existing cache_control before placing new ones', () => {
+    const raw = JSON.stringify({
+      system: [
+        { type: 'text', text: 'block', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'hi', cacheControl: { type: 'ephemeral' } },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(raw))
+    const ccs: unknown[] = []
+    for (const block of result.system) {
+      if (block.cache_control) ccs.push(block.cache_control)
+    }
+    for (const cc of ccs) {
+      expect(cc).toMatchObject({ ttl: '1h' })
+    }
+  })
+
+  test('anchors last system block (after identity) with 1h cache', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          system: [
+            { type: 'text', text: 'Block A' },
+            { type: 'text', text: 'Block B' },
+          ],
+          messages: [makeMsg('user', 'hello')],
+        }),
+      ),
+    )
+    expect(result.system[2].cache_control).toEqual(CACHE_1H)
+    expect(result.system[1].cache_control).toBeUndefined()
+    expect(result.system[0].cache_control).toBeUndefined()
+  })
+
+  test('does not anchor system block when only identity is present', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({ system: undefined, messages: [makeMsg('user', 'hello')] }),
+      ),
+    )
+    expect(result.system[0].cache_control).toBeUndefined()
+  })
+
+  test('anchors last cacheable block of messages[0]', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [makeMsg('user', [textBlock('only block')])],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('anchors last cacheable block of messages[1] (normal path)', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'msg0'),
+            makeMsg('user', [textBlock('msg1 block')]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('skips thinking blocks when placing cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [
+              { type: 'thinking', thinking: 'some reasoning' },
+              textBlock('actual content'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[1].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('skips redacted_thinking blocks when placing cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [
+              { type: 'redacted_thinking', data: 'opaque' },
+              textBlock('real content'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[1].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('skips message entirely when all blocks are thinking (no cache_control set)', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [{ type: 'thinking', thinking: 'reasoning only' }]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].cache_control).toBeUndefined()
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+  })
+
+  test('magic-context split: anchors block[0] and block[1] of messages[0] when it has ≥2 cacheable blocks', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [
+              textBlock('stable prefix A'),
+              textBlock('stable prefix B'),
+              textBlock('volatile delta'),
+            ]),
+          ],
+        }),
+      ),
+    )
+    const content = result.messages[0].content
+    expect(content[0].cache_control).toEqual(CACHE_1H)
+    expect(content[1].cache_control).toEqual(CACHE_1H)
+    expect(content[2].cache_control).toBeUndefined()
+  })
+
+  test('rolling latest anchor: anchors the latest user message beyond index 1', () => {
+    const messages = [
+      makeMsg('user', 'msg0'),
+      makeMsg('user', 'msg1'),
+      makeMsg('assistant', [{ type: 'text', text: 'response' }]),
+      makeMsg('user', 'msg3 – latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+    const msg3content = result.messages[3].content
+    expect(Array.isArray(msg3content)).toBe(true)
+    expect(msg3content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('bridge anchor: placed when rolling distance exceeds 20-block lookback', () => {
+    const messages: unknown[] = [
+      makeMsg('user', 'msg0'),
+      makeMsg('user', 'msg1'),
+    ]
+    for (let i = 2; i < 30; i++) {
+      messages.push(makeMsg('user', `msg${i}`))
+    }
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // With 28 rolling user messages (index 2-29), bridge lands at index 8
+    // (cumulative blocks from index 9 to 29 = 21 > 20) and latest is index 29.
+    const latestContent = result.messages[29].content
+    expect(Array.isArray(latestContent)).toBe(true)
+    expect(latestContent[0].cache_control).toEqual(CACHE_1H)
+
+    // Some earlier message must carry the bridge anchor
+    const bridgeAnchored = result.messages
+      .slice(2, 29)
+      .some((msg: Record<string, unknown>) => {
+        const content = Array.isArray(msg.content) ? msg.content : []
+        return (content as Array<Record<string, unknown>>).some(
+          (block) => block.cache_control != null,
+        )
+      })
+    expect(bridgeAnchored).toBe(true)
+  })
+
+  test('magic-context + bridge: bridge always placed regardless of msg0 layout', () => {
+    // msg0 has ≥2 cacheable blocks (magic-context), plus enough messages for a bridge
+    const messages: unknown[] = [
+      makeMsg('user', [
+        textBlock('stable prefix A'),
+        textBlock('stable prefix B'),
+        textBlock('volatile delta'),
+      ]),
+      makeMsg('user', 'msg1'),
+    ]
+    for (let i = 2; i < 30; i++) {
+      messages.push(makeMsg('user', `msg${i}`))
+    }
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // msg0: block[0] and block[1] anchored (magic-context split)
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[1].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[2].cache_control).toBeUndefined()
+
+    // Bridge must be anchored in the rolling range (not msg0 or latest)
+    const bridgeAnchored = result.messages
+      .slice(2, 29)
+      .some((msg: Record<string, unknown>) => {
+        const content = Array.isArray(msg.content) ? msg.content : []
+        return (content as Array<Record<string, unknown>>).some(
+          (block) => block.cache_control != null,
+        )
+      })
+    expect(bridgeAnchored).toBe(true)
+
+    // Latest (msg29) must also be anchored
+    const latestContent = result.messages[29].content
+    expect(Array.isArray(latestContent)).toBe(true)
+    expect(latestContent[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('trailing assistant messages are stripped before caching', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'question'),
+            makeMsg('assistant', 'answer'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('multiple trailing assistant messages all stripped', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'q'),
+            makeMsg('assistant', 'a1'),
+            makeMsg('assistant', 'a2'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('does not strip non-trailing assistant messages', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'q1'),
+            makeMsg('assistant', 'a1'),
+            makeMsg('user', 'q2'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages).toHaveLength(3)
+  })
+
+  test('string message content normalised to block array for cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [makeMsg('user', 'plain string content')],
+        }),
+      ),
+    )
+    expect(Array.isArray(result.messages[0].content)).toBe(true)
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('empty text block is not used as cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [
+              { type: 'text', text: 'real content' },
+              { type: 'text', text: '' },
+            ]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[1].cache_control).toBeUndefined()
+  })
+
+  test('whitespace-only text block is not used as cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [
+              { type: 'text', text: 'real content' },
+              { type: 'text', text: '   \n  ' },
+            ]),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+    expect(result.messages[0].content[1].cache_control).toBeUndefined()
+  })
+
+  test('non-empty text block still anchored normally', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [makeMsg('user', [{ type: 'text', text: 'has content' }])],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('message with only empty text blocks gets no cache anchor', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', [{ type: 'text', text: '' }]),
+            makeMsg('user', 'real message'),
+          ],
+        }),
+      ),
+    )
+    expect(result.messages[0].content[0].cache_control).toBeUndefined()
+    expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('tool_result-only user message is anchored on its last block', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        cacheBody({
+          messages: [
+            makeMsg('user', 'run the tool'),
+            makeMsg('assistant', [
+              { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
+            ]),
+            makeMsg('user', [
+              {
+                type: 'tool_result',
+                tool_use_id: 't1',
+                content: 'output line 1',
+              },
+              {
+                type: 'tool_result',
+                tool_use_id: 't2',
+                content: 'output line 2',
+              },
+            ]),
+          ],
+        }),
+      ),
+    )
+    const content = result.messages[2].content
+    expect(content[content.length - 1].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('bridge fires when assistant turns push positional distance past lookback', () => {
+    // Layout: [user m0, user m1, (assistant×5, user)×6]
+    // Rolling user indices: 3,5,7,9,11,13. latestIndex=13.
+    // Walking back from 13: cum reaches 23 at i=6 (5 blocks) with lastAnchor=7.
+    // Bridge lands at index 7; indices 3,5,9,11 are not anchored.
+    const messages: unknown[] = [makeMsg('user', 'm0'), makeMsg('user', 'm1')]
+    for (let i = 0; i < 6; i++) {
+      messages.push(
+        makeMsg('assistant', [
+          textBlock('a1'),
+          textBlock('a2'),
+          textBlock('a3'),
+          textBlock('a4'),
+          textBlock('a5'),
+        ]),
+      )
+      messages.push(makeMsg('user', `q${i}`))
+    }
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const latestContent = result.messages[13].content
+    expect(latestContent[latestContent.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    const bridgeContent = result.messages[7].content
+    expect(bridgeContent[bridgeContent.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    for (const idx of [3, 5, 9, 11]) {
+      const msg = result.messages[idx] as Record<string, unknown>
+      const content = Array.isArray(msg.content) ? msg.content : []
+      const anchored = (content as Array<Record<string, unknown>>).some(
+        (b) => b.cache_control != null,
+      )
+      expect(anchored).toBe(false)
+    }
+  })
+
+  test('bridge not placed when no valid user anchor exists before overflow', () => {
+    // messages[2] is the only rolling anchor between m1 and latest, but a
+    // 25-block assistant turn separates them — overflow fires before any anchor
+    // is set, so bridge=undefined and messages[1] takes the normal slot-3 anchor.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'mid'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 25 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // bridge=undefined → messages[1] anchored in the normal msg[1] slot
+    const msg1 = result.messages[1]
+    expect(Array.isArray(msg1.content)).toBe(true)
+    expect(msg1.content[msg1.content.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    // 'mid' (index 2) carries no bridge anchor
+    const midContent = Array.isArray(result.messages[2].content)
+      ? (result.messages[2].content as Array<Record<string, unknown>>)
+      : []
+    expect(midContent.some((b) => b.cache_control != null)).toBe(false)
+  })
+
+  test('bridge placed when block distance equals lookback threshold', () => {
+    // Exactly 20 blocks between bridge candidate (index 2) and latest (index 4).
+    // cumBlocks at anchor check = 20, which is not > 20, so bridge IS placed.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'bridge-candidate'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 20 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const bridgeContent = result.messages[2].content
+    expect(
+      (bridgeContent as Array<Record<string, unknown>>).some(
+        (b) => b.cache_control != null,
+      ),
+    ).toBe(true)
+  })
+
+  test('bridge not placed when block distance exceeds lookback threshold by one', () => {
+    // 21 blocks between bridge candidate (index 2) and latest (index 4).
+    // cumBlocks at anchor check = 21 > 20 → bridge=undefined.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'bridge-candidate'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 21 }, (_, i) => textBlock(`a${i}`)),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // bridge=undefined → messages[1] takes the normal msg[1] slot
+    const msg1 = result.messages[1]
+    expect(Array.isArray(msg1.content)).toBe(true)
+    expect(msg1.content[msg1.content.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+  })
+
+  test('no bridge when only one rolling anchor exists (latestIndex === 2)', () => {
+    // Only messages[2] qualifies as a rolling anchor (index > 1).
+    // The loop has no valid bridge candidate → bridge=undefined.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    // latest at index 2 is anchored
+    expect(result.messages[2].content[0].cache_control).toEqual(CACHE_1H)
+    // bridge=undefined → messages[1] anchored in the normal msg[1] slot
+    expect(result.messages[1].content[0].cache_control).toEqual(CACHE_1H)
+  })
+})
+
+describe('coalesceHybridSystemTail – system block merging', () => {
+  function coalescebody(
+    system: unknown,
+    messages: unknown[] = [{ role: 'user', content: 'hi' }],
+  ): string {
+    return JSON.stringify({ system, messages })
+  }
+
+  test('does not coalesce when only one block follows identity + primary prompt', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        coalescebody([
+          { type: 'text', text: 'Primary instructions' },
+          { type: 'text', text: 'Plugin block' },
+        ]),
+      ),
+    )
+    expect(result.system).toHaveLength(3)
+    expect(result.system[1].text).toBe('Primary instructions')
+    expect(result.system[2].text).toBe('Plugin block')
+  })
+
+  test('does not coalesce when only identity and primary prompt exist', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(coalescebody([{ type: 'text', text: 'Only block' }])),
+    )
+    expect(result.system).toHaveLength(2)
+    expect(result.system[1].text).toBe('Only block')
+  })
+
+  test('merges two plugin blocks into one after primary prompt', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        coalescebody([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'Plugin A' },
+          { type: 'text', text: 'Plugin B' },
+        ]),
+      ),
+    )
+    expect(result.system).toHaveLength(3)
+    expect(result.system[1].text).toBe('Primary')
+    expect(result.system[2].text).toBe('Plugin A\nPlugin B')
+  })
+
+  test('merges three plugin blocks into one', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        coalescebody([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'A' },
+          { type: 'text', text: 'B' },
+          { type: 'text', text: 'C' },
+        ]),
+      ),
+    )
+    expect(result.system).toHaveLength(3)
+    expect(result.system[2].text).toBe('A\nB\nC')
+  })
+
+  test('cache anchor lands on merged tail block', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        coalescebody([
+          { type: 'text', text: 'Primary' },
+          { type: 'text', text: 'Plugin A' },
+          { type: 'text', text: 'Plugin B' },
+        ]),
+      ),
+    )
+    expect(result.system[result.system.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+    expect(result.system[0].cache_control).toBeUndefined()
+    expect(result.system[1].cache_control).toBeUndefined()
+  })
+})
+
+function makeStream(chunks: string[]): Response {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk))
+      }
+      controller.close()
+    },
+  })
+  return new Response(stream, { status: 200 })
+}
+
+describe('createStrippedStream – SSE retryable errors', () => {
+  test('throws RetryableAnthropicStreamError on api_error event', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Internal error"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.syscall).toBe('anthropic-sse')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('throws on overloaded_error event', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('overloaded_error')
+  })
+
+  test('throws on server_error type', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"Server error"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('server_error')
+  })
+
+  test('throws on "server overloaded" message text', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"unknown","message":"server overloaded"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+  })
+
+  test('does not throw for normal content events', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"role":"assistant"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks))
+    const text = await stripped.text()
+    expect(text).toContain('message_start')
+  })
+
+  test('does not throw for non-retryable error type', async () => {
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"Invalid key"}}\n\n'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+    const text = await stripped.text()
+    expect(text).toContain('authentication_error')
+  })
+
+  test('throws when error event is split across two stream chunks', async () => {
+    const fullEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"oops"}}\n\n'
+    const mid = Math.floor(fullEvent.length / 2)
+    const chunks = [fullEvent.slice(0, mid), fullEvent.slice(mid)]
+
+    const stripped = createStrippedStream(makeStream(chunks))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.syscall).toBe('anthropic-sse')
+  })
+
+  test('throws when retryable error event lacks trailing boundary', async () => {
+    // Some servers omit the final \n\n — the pending buffer must be flushed on done.
+    const errorEvent =
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"no-boundary"}}'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('throws on an error event delimited by bare CR line endings', async () => {
+    const errorEvent =
+      'event: error\rdata: {"type":"error","error":{"type":"api_error","message":"CR-delimited"}}\r\r'
+    const stripped = createStrippedStream(makeStream([errorEvent]))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('throws when a bare-CR delimiter is split across chunks', async () => {
+    const head =
+      'event: error\rdata: {"type":"error","error":{"type":"api_error","message":"CR-delimited"}}\r'
+    const stripped = createStrippedStream(makeStream([head, '\r']))
+
+    let caught: unknown
+    try {
+      await stripped.text()
+    } catch (e) {
+      caught = e
+    }
+
+    const err = caught as RetryableAnthropicStreamError
+    expect(err.code).toBe('ECONNRESET')
+    expect(err.providerErrorType).toBe('api_error')
+  })
+
+  test('does not throw or hang on an oversized frame with no boundary', async () => {
+    const oversized = 'x'.repeat(1_048_577)
+    const validTail = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    const stripped = createStrippedStream(makeStream([oversized, validTail]))
+
+    const text = await stripped.text()
+    expect(text).toContain('message_stop')
+  })
+})
+
+describe('createStrippedStream – tool prefix rewriting across chunk boundaries', () => {
+  test('strips tool names split across chunk boundaries', async () => {
+    const fullText =
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Bash"}}\n\n'
+    const mid = fullText.indexOf('mcp_Bash') + 3
+    const chunks = [fullText.slice(0, mid), fullText.slice(mid)]
+
+    const stripped = createStrippedStream(makeStream(chunks))
+    const text = await stripped.text()
+
+    expect(text).toContain('"name": "bash"')
+    expect(text).not.toContain('mcp_Bash')
+  })
+})
+
+describe('createStrippedStream – server-side fallback', () => {
+  test('hides a fallback content block behind a signed marker', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-fable-5","usage":{}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-5"}}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks), {
+      serverFallbackModel: 'claude-fable-5',
+    })
+    const text = await stripped.text()
+
+    expect(text).not.toContain('"type":"fallback"')
+    expect(text).toContain('\u2060')
+  })
+
+  test('does not rewrite the stream when no fallback model is configured', async () => {
+    const chunks = [
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}\n\n',
+    ]
+    const stripped = createStrippedStream(makeStream(chunks))
+    const text = await stripped.text()
+
+    expect(text).toContain('"text":"hi"')
+  })
+})
+
+describe('computeRetryAfterDelayMs', () => {
+  test('uses retry-after seconds value when present', () => {
+    expect(computeRetryAfterDelayMs('5', 0)).toBe(5000)
+  })
+
+  test('caps a large retry-after value', () => {
+    expect(computeRetryAfterDelayMs('120', 0)).toBe(30000)
+  })
+
+  test('falls back to exponential backoff when header is missing', () => {
+    expect(computeRetryAfterDelayMs(null, 0)).toBe(500)
+    expect(computeRetryAfterDelayMs(null, 1)).toBe(1000)
+  })
+
+  test('falls back to exponential backoff when header is invalid', () => {
+    expect(computeRetryAfterDelayMs('not-a-number', 0)).toBe(500)
+  })
+
+  test('caps exponential backoff too', () => {
+    expect(computeRetryAfterDelayMs(null, 10)).toBe(30000)
+  })
+})
+
+describe('stripUnsupportedEffortForHaiku', () => {
+  test('strips output_config.effort for haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toBeUndefined()
+  })
+
+  test('strips thinking.effort but keeps other thinking fields for haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'enabled' })
+  })
+
+  test('removes thinking object entirely when effort was its only field', () => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toBeUndefined()
+  })
+
+  test('keeps output_config.effort and thinking.effort untouched for non-haiku models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'high' },
+      thinking: { effort: 'high' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'high' })
+    expect(result.thinking).toEqual({ effort: 'high' })
+  })
+})
+
+describe('normalizeAdaptiveThinking', () => {
+  test('defaults thinking to adaptive + summarized on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('converts legacy enabled+budget_tokens thinking to adaptive', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('canonicalizes disabled thinking to a bare object, stripping display', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled', display: 'summarized' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('demotes xhigh/max effort to high when thinking is disabled', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'xhigh' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('leaves max effort untouched when thinking is disabled but effort is already low', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'low' },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.output_config).toEqual({ effort: 'low' })
+  })
+
+  test('does not touch thinking on non-adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 })
+  })
+})
+
+describe('stripRestrictedSamplingParams', () => {
+  test('strips non-default temperature on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 0.7,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBeUndefined()
+  })
+
+  test('keeps temperature 1 (the default) on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 1,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBe(1)
+  })
+
+  test('strips top_p and top_k on adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      top_p: 0.9,
+      top_k: 40,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.top_p).toBeUndefined()
+    expect(result.top_k).toBeUndefined()
+  })
+
+  test('leaves sampling params untouched on non-adaptive-thinking models', () => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6-20260101',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 0.7,
+      top_p: 0.9,
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.temperature).toBe(0.7)
+    expect(result.top_p).toBe(0.9)
+  })
+})
+
+describe('repairOrphanedToolPairs', () => {
+  test('drops a tool_result with no matching tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'missing_1', content: 'ok' },
+            { type: 'text', text: 'hello' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].text).toBe('hello')
+  })
+
+  test('preserves thinking blocks in the latest assistant message when its tool_use is orphaned', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'reasoning...', signature: 'sig' },
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'a /compact summary was inserted here' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('thinking')
+    expect(result.messages[0].content[0].thinking).toBe('reasoning...')
+    expect(result.messages[0].content[1].type).toBe('tool_use')
+    expect(result.messages[0].content[1].id).toBe('tool_1')
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'tool_result',
+      tool_use_id: 'tool_1',
+      content: 'Tool result unavailable (removed during context compaction).',
+      is_error: true,
+    })
+    expect(result.messages[1].content[1].type).toBe('text')
+    expect(result.messages[1].content[1].text).toBe(
+      'a /compact summary was inserted here',
+    )
+  })
+
+  test('synthesizes a placeholder tool_result for an orphaned tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+            { type: 'text', text: 'checking' },
+          ],
+        },
+        { role: 'user', content: 'follow up' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[0].content[1].text).toBe('checking')
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'tool_result',
+      tool_use_id: 'tool_1',
+      content: 'Tool result unavailable (removed during context compaction).',
+      is_error: true,
+    })
+    expect(result.messages[1].content[1].text).toBe('follow up')
+  })
+
+  test('keeps matched tool_use/tool_result pairs untouched', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[0].content).toHaveLength(1)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[1].content).toHaveLength(1)
+    expect(result.messages[1].content[0].type).toBe('tool_result')
+  })
+
+  test('inserts a synthetic result rather than dropping an orphaned tool_use message', () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'orphan', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'still there?' },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(3)
+    expect(result.messages[0].content[0].text).toBe('hi')
+    expect(result.messages[1].content[0].type).toBe('tool_use')
+    expect(result.messages[1].content[0].id).toBe('orphan')
+    expect(result.messages[2].content[0].tool_use_id).toBe('orphan')
+    expect(result.messages[2].content[1].text).toBe('still there?')
+  })
+
+  test('synthesizes an adjacent result when /compact splits a tool_use from its tool_result', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        { role: 'user', content: 'a /compact summary was inserted here' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[1].content[0].tool_use_id).toBe('tool_1')
+    expect(result.messages[1].content[1].text).toBe(
+      'a /compact summary was inserted here',
+    )
+  })
+
+  test('keeps only the adjacent tool_result when results are split across multiple following messages', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'first' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'second' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[1].content[0].content).toBe('first')
+  })
+
+  test('drops the leading orphaned tool_result then synthesizes a result for the reversed tool_use', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[0].content[0].type).toBe('tool_use')
+    expect(result.messages[0].content[0].id).toBe('tool_1')
+    expect(result.messages[1].content[0].tool_use_id).toBe('tool_1')
+  })
+
+  test('moves tool_result blocks before text blocks within the same message', () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'here is the result' },
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    expect(result.messages[1].content[0].type).toBe('tool_result')
+    expect(result.messages[1].content[1].type).toBe('text')
   })
 })

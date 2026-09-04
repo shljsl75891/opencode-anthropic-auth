@@ -1,9 +1,13 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange } from './auth.ts'
-import { resolveClaudeCodeVersion } from './config.ts'
-import { CLAUDE_CODE_VERSION, CLIENT_ID, TOKEN_URL } from './constants.ts'
+import { CLIENT_ID, OAUTH_REFRESH_SKEW_MS, TOKEN_URL } from './constants.ts'
+import { parseQuotaHeaders } from './quota-headers.ts'
+import { writeQuotaState } from './quota-state.ts'
+import { isRecoverableRefusalModel } from './server-fallback.ts'
 import {
+  computeRetryAfterDelayMs,
   createStrippedStream,
+  extractModelId,
   isInsecure,
   mergeHeaders,
   rewriteRequestBody,
@@ -11,46 +15,9 @@ import {
   setOAuthHeaders,
 } from './transform.ts'
 
-/**
- * Report a problem with the version override to the server log.
- *
- * Best-effort: a misconfigured override either degrades to the bundled version
- * or is honoured as set, so a logging failure must not take the plugin down
- * with it.
- */
-async function logVersionOverrideIssue(
-  client: unknown,
-  level: 'warn' | 'error',
-  message: string,
-): Promise<void> {
-  try {
-    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose app.log
-    await (client as any)?.app?.log({
-      body: {
-        service: 'anthropic-auth',
-        level,
-        message,
-      },
-    })
-  } catch {
-    /* Logging is best-effort; the resolved version still applies. */
-  }
-}
+const MAX_429_RETRIES = 3
 
 export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
-  // Resolved once per plugin instance so every request reports the same
-  // version in both the user-agent and the billing header.
-  const resolution = resolveClaudeCodeVersion()
-  if (resolution.type === 'invalid') {
-    await logVersionOverrideIssue(client, 'error', resolution.error)
-  } else if (resolution.type === 'outdated') {
-    await logVersionOverrideIssue(client, 'warn', resolution.warning)
-  }
-  // Only a malformed override lacks a usable version; an outdated one was set
-  // deliberately, so it is reported as configured.
-  const claudeCodeVersion =
-    resolution.type === 'invalid' ? CLAUDE_CODE_VERSION : resolution.version
-
   return {
     auth: {
       provider: 'anthropic',
@@ -81,123 +48,206 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           // from racing against each other (and causing 401 cascades with token rotation)
           let refreshPromise: Promise<string> | null = null
 
+          function triggerRefresh(): Promise<string> {
+            if (!refreshPromise) {
+              refreshPromise = (async () => {
+                const maxRetries = 2
+                const baseDelayMs = 500
+
+                for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                  try {
+                    if (attempt > 0) {
+                      const delay = baseDelayMs * 2 ** (attempt - 1)
+                      await new Promise((resolve) => setTimeout(resolve, delay))
+                    }
+
+                    // Re-read auth to get the latest refresh token.
+                    // The outer `auth` snapshot may be stale if tokens
+                    // were rotated since the fetch() call was made.
+                    const freshAuth = await getAuth()
+
+                    const response = await fetch(TOKEN_URL, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'application/json, text/plain, */*',
+                        'User-Agent': 'axios/1.13.6',
+                      },
+                      body: JSON.stringify({
+                        grant_type: 'refresh_token',
+                        refresh_token: freshAuth.refresh,
+                        client_id: CLIENT_ID,
+                      }),
+                    })
+
+                    if (!response.ok) {
+                      if (response.status === 429 && attempt < maxRetries) {
+                        // Honor the token endpoint's own backoff hint instead
+                        // of the generic exponential delay below.
+                        const retryAfterDelay = computeRetryAfterDelayMs(
+                          response.headers.get('retry-after'),
+                          attempt,
+                        )
+                        await response.body?.cancel()
+                        await new Promise((resolve) =>
+                          setTimeout(resolve, retryAfterDelay),
+                        )
+                        continue
+                      }
+
+                      if (response.status >= 500 && attempt < maxRetries) {
+                        await response.body?.cancel()
+                        continue
+                      }
+
+                      const body = await response.text().catch(() => '')
+                      throw new Error(
+                        `Token refresh failed: ${response.status} — ${body}`,
+                      )
+                    }
+
+                    const json = (await response.json()) as {
+                      refresh_token: string
+                      access_token: string
+                      expires_in: number
+                    }
+
+                    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+                    await (client as any).auth.set({
+                      path: {
+                        id: 'anthropic',
+                      },
+                      body: {
+                        type: 'oauth',
+                        refresh: json.refresh_token,
+                        access: json.access_token,
+                        expires: Date.now() + json.expires_in * 1000,
+                      },
+                    })
+
+                    return json.access_token
+                  } catch (error) {
+                    const isNetworkError =
+                      error instanceof Error &&
+                      (error.message.includes('fetch failed') ||
+                        ('code' in error &&
+                          (error.code === 'ECONNRESET' ||
+                            error.code === 'ECONNREFUSED' ||
+                            error.code === 'ETIMEDOUT' ||
+                            error.code === 'UND_ERR_CONNECT_TIMEOUT')))
+
+                    if (attempt < maxRetries && isNetworkError) {
+                      continue
+                    }
+
+                    throw error
+                  }
+                }
+                // Unreachable — each iteration either returns or throws.
+                // Kept as a TypeScript exhaustiveness guard.
+                throw new Error('Token refresh exhausted all retries')
+              })().finally(() => {
+                refreshPromise = null
+              })
+            }
+            return refreshPromise
+          }
+
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
               const auth = await getAuth()
               if (auth.type !== 'oauth') return fetch(input, init)
-              if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                if (!refreshPromise) {
-                  refreshPromise = (async () => {
-                    const maxRetries = 2
-                    const baseDelayMs = 500
-
-                    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                      try {
-                        if (attempt > 0) {
-                          const delay = baseDelayMs * 2 ** (attempt - 1)
-                          await new Promise((resolve) =>
-                            setTimeout(resolve, delay),
-                          )
-                        }
-
-                        // Re-read auth to get the latest refresh token.
-                        // The outer `auth` snapshot may be stale if tokens
-                        // were rotated since the fetch() call was made.
-                        const freshAuth = await getAuth()
-
-                        const response = await fetch(TOKEN_URL, {
-                          method: 'POST',
-                          headers: {
-                            'Content-Type': 'application/json',
-                            Accept: 'application/json, text/plain, */*',
-                            'User-Agent': 'axios/1.13.6',
-                          },
-                          body: JSON.stringify({
-                            grant_type: 'refresh_token',
-                            refresh_token: freshAuth.refresh,
-                            client_id: CLIENT_ID,
-                          }),
-                        })
-
-                        if (!response.ok) {
-                          if (response.status >= 500 && attempt < maxRetries) {
-                            await response.body?.cancel()
-                            continue
-                          }
-
-                          const body = await response.text().catch(() => '')
-                          throw new Error(
-                            `Token refresh failed: ${response.status} — ${body}`,
-                          )
-                        }
-
-                        const json = (await response.json()) as {
-                          refresh_token: string
-                          access_token: string
-                          expires_in: number
-                        }
-
-                        // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                        await (client as any).auth.set({
-                          path: {
-                            id: 'anthropic',
-                          },
-                          body: {
-                            type: 'oauth',
-                            refresh: json.refresh_token,
-                            access: json.access_token,
-                            expires: Date.now() + json.expires_in * 1000,
-                          },
-                        })
-
-                        return json.access_token
-                      } catch (error) {
-                        const isNetworkError =
-                          error instanceof Error &&
-                          (error.message.includes('fetch failed') ||
-                            ('code' in error &&
-                              (error.code === 'ECONNRESET' ||
-                                error.code === 'ECONNREFUSED' ||
-                                error.code === 'ETIMEDOUT' ||
-                                error.code === 'UND_ERR_CONNECT_TIMEOUT')))
-
-                        if (attempt < maxRetries && isNetworkError) {
-                          continue
-                        }
-
-                        throw error
-                      }
-                    }
-                    // Unreachable — each iteration either returns or throws.
-                    // Kept as a TypeScript exhaustiveness guard.
-                    throw new Error('Token refresh exhausted all retries')
-                  })().finally(() => {
-                    refreshPromise = null
-                  })
-                }
-                auth.access = await refreshPromise
+              if (
+                !auth.access ||
+                !auth.expires ||
+                auth.expires < Date.now() + OAUTH_REFRESH_SKEW_MS
+              ) {
+                auth.access = await triggerRefresh()
               }
 
               const requestHeaders = mergeHeaders(input, init)
-              // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-              setOAuthHeaders(requestHeaders, auth.access!, claudeCodeVersion)
+              const rawBody = init?.body
+              const modelId =
+                typeof rawBody === 'string'
+                  ? extractModelId(rawBody)
+                  : undefined
 
-              let body = init?.body
+              let body = rawBody
               if (body && typeof body === 'string') {
-                body = rewriteRequestBody(body, claudeCodeVersion)
+                body = rewriteRequestBody(body)
               }
+
+              let parsedBody: unknown
+              if (typeof body === 'string') {
+                try {
+                  parsedBody = JSON.parse(body)
+                } catch {
+                  parsedBody = undefined
+                }
+              }
+
+              // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
+              setOAuthHeaders(requestHeaders, auth.access!, modelId, parsedBody)
 
               const rewritten = rewriteUrl(input)
 
-              const response = await fetch(rewritten.input, {
-                ...init,
-                body,
-                headers: requestHeaders,
-                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              })
+              let accessToken = auth.access
+              let forcedRefreshAttempted = false
+              let response: Response
+              for (let attempt = 0; ; attempt++) {
+                response = await fetch(rewritten.input, {
+                  ...init,
+                  body,
+                  headers: requestHeaders,
+                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                })
 
-              return createStrippedStream(response)
+                if (response.status === 401 && !forcedRefreshAttempted) {
+                  forcedRefreshAttempted = true
+                  await response.body?.cancel()
+
+                  // Force a refresh regardless of the cached expiry — the
+                  // token may have been rejected before local expiry (e.g.
+                  // revoked, or clock skew). Only retry if the refreshed
+                  // token actually changed, to avoid looping forever
+                  // against a permanently-rejected grant.
+                  const refreshed = await triggerRefresh()
+                  if (refreshed === accessToken) break
+
+                  accessToken = refreshed
+                  setOAuthHeaders(
+                    requestHeaders,
+                    refreshed,
+                    modelId,
+                    parsedBody,
+                  )
+                  continue
+                }
+
+                if (response.status !== 429 || attempt >= MAX_429_RETRIES) {
+                  break
+                }
+
+                const delay = computeRetryAfterDelayMs(
+                  response.headers.get('retry-after'),
+                  attempt,
+                )
+                await response.body?.cancel()
+                await new Promise((resolve) => setTimeout(resolve, delay))
+              }
+
+              try {
+                const quota = parseQuotaHeaders(response.headers)
+                if (quota) writeQuotaState(quota)
+              } catch {
+                // Sidebar visibility is best-effort; never fail the request over it.
+              }
+
+              const serverFallbackModel = isRecoverableRefusalModel(modelId)
+                ? modelId
+                : undefined
+              return createStrippedStream(response, { serverFallbackModel })
             },
           }
         }
@@ -266,4 +316,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
     },
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
+}
+
+export default {
+  id: '@sahiljassal/opencode-anthropic-auth',
+  server: AnthropicAuthPlugin,
 }

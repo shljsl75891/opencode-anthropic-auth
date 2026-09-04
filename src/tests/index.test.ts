@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { buildBillingHeaderValue } from '../cch'
-import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
-import { CLAUDE_CODE_VERSION } from '../constants'
-import { AnthropicAuthPlugin } from '../index'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import plugin, { AnthropicAuthPlugin } from '../index'
+import { readQuotaState } from '../quota-state'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -16,9 +17,6 @@ function createMockClient() {
   return {
     auth: {
       set: mock(() => Promise.resolve()),
-    },
-    app: {
-      log: mock(() => Promise.resolve()),
     },
   }
 }
@@ -68,24 +66,12 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
   })) as Promise<any>
 }
 
-// The plugin reads ANTHROPIC_CLAUDE_CODE_VERSION at load time, so an ambient
-// value in the developer's shell would otherwise leak into every test in this
-// file.
-const originalVersionEnv = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
-
-beforeEach(() => {
-  delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
-})
-
-afterEach(() => {
-  if (originalVersionEnv === undefined) {
-    delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
-  } else {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = originalVersionEnv
-  }
-})
-
 describe('AnthropicAuthPlugin', () => {
+  test('exports a server plugin module for package loading', () => {
+    expect(plugin.id).toBe('@sahiljassal/opencode-anthropic-auth')
+    expect(plugin.server).toBe(AnthropicAuthPlugin)
+  })
+
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
     expect(plugin.auth).toBeDefined()
@@ -162,7 +148,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models },
     )
@@ -181,7 +167,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -206,7 +192,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'my-access-token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -230,15 +216,133 @@ describe('auth.loader', () => {
     const parsedBody = JSON.parse(capturedBody!)
     // Tool name should be prefixed
     expect(parsedBody.tools[0].name).toBe('mcp_Bash')
-    // Three-block layout: billing header, identity, rest
-    expect(parsedBody.system).toHaveLength(3)
-    expect(parsedBody.system[0].text).toContain('x-anthropic-billing-header')
-    expect(parsedBody.system[1].text).toBe(
-      "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    // Two-block layout: identity, rest (billing header removed in 1e03543)
+    expect(parsedBody.system).toHaveLength(2)
+    expect(parsedBody.system[0].text).toBe(
+      "You are Claude Code, Anthropic's official CLI for Claude.",
     )
-    expect(parsedBody.system[2].text).toBe('You are a helpful assistant.')
-    // User message is untouched
-    expect(parsedBody.messages[0].content).toBe('hello world test message')
+    expect(parsedBody.system[1].text).toBe('You are a helpful assistant.')
+    // User message content normalised to block array with cache anchor
+    expect(parsedBody.messages[0].content[0].text).toBe(
+      'hello world test message',
+    )
+  })
+
+  test('fetch wrapper opts a recoverable-refusal model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBe('default')
+  })
+
+  test('fetch wrapper does not opt an unrelated model into server-side fallback', async () => {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
+    expect(JSON.parse(capturedBody!).fallbacks).toBeUndefined()
+  })
+
+  test('fetch wrapper hides a fallback content block in a streamed response', async () => {
+    const encoder = new TextEncoder()
+    const responseStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-5"}}}\n\n',
+          ),
+        )
+        controller.close()
+      },
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(responseStream, { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      },
+    )
+
+    const text = await response.text()
+    expect(text).not.toContain('"type":"fallback"')
+    expect(text).toContain('\u2060')
   })
 
   test('fetch wrapper refreshes expired token', async () => {
@@ -389,6 +493,69 @@ describe('auth.loader', () => {
     expect(tokenRefreshCalls).toBe(1)
   })
 
+  test('fetch wrapper honors Retry-After when the token endpoint returns 429', async () => {
+    let tokenRefreshCalls = 0
+    const delays: number[] = []
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown, delay: number) => {
+      delays.push(delay)
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+
+        if (tokenRefreshCalls === 1) {
+          return Promise.resolve(
+            new Response('Too Many Requests', {
+              status: 429,
+              headers: { 'retry-after': '2' },
+            }),
+          )
+        }
+
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'expired',
+          refresh: 'refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: '{}',
+    })
+
+    expect(tokenRefreshCalls).toBe(2)
+    expect(delays).toContain(2000)
+  })
+
   test('fetch wrapper strips tool prefix from streaming response', async () => {
     const encoder = new TextEncoder()
     const responseStream = new ReadableStream({
@@ -403,12 +570,7 @@ describe('auth.loader', () => {
     })
 
     globalThis.fetch = mock(() =>
-      Promise.resolve(
-        new Response(responseStream, {
-          status: 200,
-          headers: { 'content-type': 'text/event-stream' },
-        }),
-      ),
+      Promise.resolve(new Response(responseStream, { status: 200 })),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -418,7 +580,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -604,6 +766,138 @@ describe('auth.loader', () => {
     expect(sentBody.refresh_token).not.toBe('stale-refresh')
   })
 
+  test('fetch wrapper excludes interleaved-thinking beta for haiku models', async () => {
+    let capturedHeaders: Headers | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001' }),
+    })
+
+    expect(capturedHeaders!.get('anthropic-beta')).not.toContain(
+      'interleaved-thinking-2025-05-14',
+    )
+  })
+
+  test('fetch wrapper retries a 429 response and returns eventual success', async () => {
+    let callCount = 0
+    const delays: number[] = []
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown, delay: number) => {
+      delays.push(delay)
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      if (callCount === 1) {
+        return Promise.resolve(
+          new Response(null, {
+            status: 429,
+            headers: { 'retry-after': '1' },
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(2)
+    expect(delays).toEqual([1000])
+    expect(response.status).toBe(200)
+  })
+
+  test('fetch wrapper gives up after max 429 retries and returns the 429 response', async () => {
+    let callCount = 0
+
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 429 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    // Initial attempt + MAX_429_RETRIES(3) retries = 4 calls total
+    expect(callCount).toBe(4)
+    expect(response.status).toBe(429)
+  })
+
+  test('fetch wrapper does not retry non-429 error statuses', async () => {
+    let callCount = 0
+
+    globalThis.fetch = mock(() => {
+      callCount++
+      return Promise.resolve(new Response(null, { status: 500 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(callCount).toBe(1)
+    expect(response.status).toBe(500)
+  })
+
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {
     let capturedUrl: string | undefined
 
@@ -619,7 +913,7 @@ describe('auth.loader', () => {
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
@@ -631,141 +925,279 @@ describe('auth.loader', () => {
 
     expect(capturedUrl).toContain('beta=true')
   })
-})
 
-describe('reported Claude Code version', () => {
-  const originalFetch = globalThis.fetch
-  const USER_MESSAGE = 'hello world test message'
+  test('fetch wrapper proactively refreshes a token nearing expiry', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch
-  })
+    const fetchCalls: string[] = []
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      fetchCalls.push(url)
 
-  /**
-   * Drive one OAuth request through the plugin and return the two places the
-   * Claude Code version is reported to Anthropic.
-   */
-  async function captureReportedVersion(
-    client: ReturnType<typeof createMockClient>,
-  ) {
-    let capturedHeaders: Headers | undefined
-    let capturedBody: string | undefined
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
 
-    globalThis.fetch = mock((_input: any, init: any) => {
-      capturedHeaders = init?.headers
-      capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
-    const plugin = await getPlugin(client)
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'still-valid-token',
+          refresh: 'old-refresh',
+          // Expires in 2 minutes — inside the 5-minute proactive skew window.
+          expires: Date.now() + 2 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(fetchCalls.some((url) => url.includes('/v1/oauth/token'))).toBe(true)
+    expect(mockClient.auth.set).toHaveBeenCalled()
+  })
+
+  test('fetch wrapper does not refresh a token outside the skew window', async () => {
+    const fetchCalls: string[] = []
+    globalThis.fetch = mock((input: any) => {
+      fetchCalls.push(extractUrl(input))
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
           type: 'oauth',
           access: 'token',
           refresh: 'refresh',
-          expires: Date.now() + 100000,
+          // Expires in 1 hour — well outside the 5-minute skew window.
+          expires: Date.now() + 60 * 60_000,
         }),
       { models: {} },
     )
 
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: JSON.stringify({
-        messages: [{ role: 'user', content: USER_MESSAGE }],
-      }),
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(fetchCalls.some((url) => url.includes('/v1/oauth/token'))).toBe(
+      false,
+    )
+  })
+
+  test('fetch wrapper forces a refresh and retries once on a 401 response', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
     })
 
-    return {
-      userAgent: capturedHeaders!.get('user-agent'),
-      billingHeader: JSON.parse(capturedBody!).system[0].text as string,
+    let messagesCallCount = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'new-refresh',
+              access_token: 'refreshed-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      messagesCallCount += 1
+      if (messagesCallCount === 1) {
+        return Promise.resolve(new Response(null, { status: 401 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'stale-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(messagesCallCount).toBe(2)
+    expect(response.status).toBe(200)
+    expect(mockClient.auth.set).toHaveBeenCalled()
+  })
+
+  test('fetch wrapper does not loop on 401 when the refreshed token is unchanged', async () => {
+    // @ts-expect-error — mock override for testing
+    globalThis.setTimeout = mock((handler: () => unknown) => {
+      handler()
+      return 0
+    })
+
+    let messagesCallCount = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/oauth/token')) {
+        // Refresh "succeeds" but returns the same access token (e.g. a
+        // revoked-grant edge case) — must not retry forever.
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'refresh',
+              access_token: 'stale-token',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+
+      messagesCallCount += 1
+      return Promise.resolve(new Response(null, { status: 401 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'stale-token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(messagesCallCount).toBe(1)
+    expect(response.status).toBe(401)
+  })
+})
+
+describe('quota harvesting', () => {
+  const originalFetch = globalThis.fetch
+  let quotaFile: string
+  let originalEnv: string | undefined
+
+  beforeEach(() => {
+    globalThis.fetch = originalFetch
+    quotaFile = join(mkdtempSync(join(tmpdir(), 'quota-test-')), 'quota.json')
+    originalEnv = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE = quotaFile
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    if (originalEnv === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FILE = originalEnv
     }
-  }
-
-  /** Read the single startup log call the plugin made about the override. */
-  function readSingleLog(client: ReturnType<typeof createMockClient>) {
-    expect(client.app.log).toHaveBeenCalledTimes(1)
-    return (client.app.log as unknown as ReturnType<typeof mock>).mock
-      .calls[0]![0] as { body: { level: string; message: string } }
-  }
-
-  test('reports the bundled version when the override is unset', async () => {
-    const { userAgent, billingHeader } = await captureReportedVersion(
-      createMockClient(),
-    )
-
-    expect(userAgent).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`)
-    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
   })
 
-  test('reports a valid override in both the user-agent and billing header', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '  2.9.99  '
-
-    const { userAgent, billingHeader } = await captureReportedVersion(
-      createMockClient(),
-    )
-
-    expect(userAgent).toBe('claude-cli/2.9.99 (external, cli)')
-    // The billing suffix is derived from the override, not the bundled version.
-    expect(billingHeader).toBe(
-      buildBillingHeaderValue(
-        [{ role: 'user', content: USER_MESSAGE }],
-        '2.9.99',
-        'sdk-cli',
+  test('writes quota state from response headers', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(null, {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.5',
+            'anthropic-ratelimit-unified-5h-reset': '1893456000',
+          },
+        }),
       ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
     )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(readQuotaState(quotaFile)?.fiveHour?.usedPercent).toBe(50)
   })
 
-  test('logs and falls back to the bundled version for a malformed override', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = 'latest'
-    const client = createMockClient()
+  test('does not throw when no quota headers are present', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
 
-    const { userAgent, billingHeader } = await captureReportedVersion(client)
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
 
-    const logged = readSingleLog(client)
-    expect(logged.body.level).toBe('error')
-    expect(logged.body.message).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
-    expect(logged.body.message).toContain('major.minor.patch')
-
-    // Falling back keeps both reported values valid and in agreement.
-    expect(userAgent).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`)
-    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).resolves.toBeDefined()
+    expect(readQuotaState(quotaFile)).toBeUndefined()
   })
 
-  test('warns but still reports an override older than the bundled version', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.1.257'
-    const client = createMockClient()
+  test('serves the response even when quota headers are malformed', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(null, {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.5',
+            'anthropic-ratelimit-unified-5h-reset': '1e308',
+          },
+        }),
+      ),
+    ) as unknown as typeof fetch
 
-    const { userAgent, billingHeader } = await captureReportedVersion(client)
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 60 * 60_000,
+        }),
+      { models: {} },
+    )
 
-    const logged = readSingleLog(client)
-    expect(logged.body.level).toBe('warn')
-    expect(logged.body.message).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
-    expect(logged.body.message).toContain(CLAUDE_CODE_VERSION)
-
-    // Warning it is not the same as ignoring it: the explicit override still
-    // reaches both reported places.
-    expect(userAgent).toBe('claude-cli/2.1.257 (external, cli)')
-    expect(billingHeader).toContain('cc_version=2.1.257.')
-  })
-
-  test('stays silent for an override at or above the bundled version', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = CLAUDE_CODE_VERSION
-    const client = createMockClient()
-
-    await captureReportedVersion(client)
-
-    expect(client.app.log).not.toHaveBeenCalled()
-  })
-
-  test('loads without throwing when the client cannot log', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = 'latest'
-
-    const plugin = await AnthropicAuthPlugin({
-      // @ts-expect-error: client without app.log, as in older OpenCode builds
-      client: { auth: { set: mock(() => Promise.resolve()) } },
-    })
-
-    expect((plugin as any).auth.provider).toBe('anthropic')
+    await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).resolves.toBeDefined()
   })
 })

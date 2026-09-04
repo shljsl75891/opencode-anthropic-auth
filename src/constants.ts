@@ -21,14 +21,43 @@ export const OAUTH_SCOPES = [
 
 export const TOOL_PREFIX = 'mcp_'
 
+/**
+ * Content for a synthesized tool_result whose real output was removed by a
+ * /compact or /undo summary insertion (see repairOrphanedToolPairs).
+ */
+export const TOOL_RESULT_PLACEHOLDER =
+  'Tool result unavailable (removed during context compaction).'
+
+/**
+ * Anthropic's cache lookback window size. Each explicit breakpoint scans at
+ * most this many content blocks backward (counting the breakpoint block as
+ * position 1, across all roles and types — text, thinking, tool_use,
+ * tool_result, …). When the estimated block count between two user-role anchors
+ * would exceed this threshold, a bridge anchor is inserted to keep the older
+ * breakpoint inside the window and the cached prefix reachable.
+ */
+export const ANTHROPIC_CACHE_LOOKBACK_BLOCKS = 20
+
 export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
 ]
 
 export const OPENCODE_IDENTITY_PREFIX = 'You are OpenCode'
 export const CLAUDE_CODE_IDENTITY =
-  "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+  "You are Claude Code, Anthropic's official CLI for Claude."
+
+/**
+ * Model families with adaptive thinking (thinking defaults on, display
+ * defaults to "omitted"). These models reject legacy manual thinking
+ * (type: enabled + budget_tokens) and non-default temperature/top_p/top_k.
+ */
+export const ADAPTIVE_THINKING_MODEL_PATTERN =
+  /claude-(opus-5|opus-4-8|opus-4-7|sonnet-5|fable-5|mythos-5)/i
+
+/** Proactive OAuth refresh margin — refresh this long before actual expiry. */
+export const OAUTH_REFRESH_SKEW_MS = 5 * 60_000
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
@@ -43,7 +72,7 @@ export const CCH_POSITIONS = [4, 7, 20]
  * `@anthropic-ai/claude-code` release, otherwise new models are unreachable.
  */
 export const CLAUDE_CODE_VERSION = '2.1.258'
-export const CLAUDE_CODE_ENTRYPOINT = 'sdk-cli'
+export const CLAUDE_CODE_ENTRYPOINT = 'cli'
 
 /**
  * Build the `user-agent` value for a reported Claude Code version.
