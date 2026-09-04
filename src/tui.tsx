@@ -76,5 +76,10 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-const plugin: TuiPluginModule = { tui }
+// Path-referenced plugins (config `plugin: ["/abs/path"]`) require an
+// exported id; the host throws "Path plugin must export id" without it.
+const plugin: TuiPluginModule & { id: string } = {
+  id: '@sahiljassal/opencode-anthropic-auth',
+  tui,
+}
 export default plugin

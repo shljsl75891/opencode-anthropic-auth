@@ -16,10 +16,6 @@
       "import": "./src/tui.tsx"
     }
   },
-  "oc-plugin": [
-    "server",
-    "tui"
-  ],
   "engines": {
     "bun": "1.3.14"
   },
