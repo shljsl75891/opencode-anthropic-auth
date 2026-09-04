@@ -1,22 +1,171 @@
 # @ex-machina/opencode-anthropic-auth
 
-## 1.8.4
+## 3.0.5
 
 ### Patch Changes
 
-- [#229](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/229) [`774acbf`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/774acbfccf3d8d59b00147759ef1cfa4e3c531ee) Thanks [@eXamadeus](https://github.com/eXamadeus)! - Allow the reported Claude Code version to be configured via the `ANTHROPIC_CLAUDE_CODE_VERSION` environment variable. Anthropic gates model access on this value server-side and moves that gate on its own schedule, so a newly-gated model previously required waiting for a plugin release. Setting `ANTHROPIC_CLAUDE_CODE_VERSION` to a `major.minor.patch` value now overrides the bundled default for both places the version is reported — the `user-agent` header and the billing header's `cc_version` — which are resolved from a single value so they cannot disagree. The variable is read once at startup; a malformed value is logged as an error and the bundled version is used instead, and a value older than the bundled version is honored but logged as a warning, since reporting an older version is what triggers the gate in the first place. Thanks to @johnnymo87 for pointing out that a lower override silently defeats the purpose of the setting.
+- Never fail a request over quota harvesting: a `reset` header that is finite but outside the range `Date` can represent (e.g. `1e308`) made `toISOString()` throw from outside the best-effort `try`, surfacing as a failed API call. Reject unrepresentable dates and harvest entirely inside the guard.
+- Fail retryably instead of leaking a fallback block: when an SSE event exceeded the 1 MiB buffer with no delimiter, the server-side-fallback rewriter forwarded the partial buffer as if it were a whole event, so a half-parsed `fallback` block passed through unrewritten. Raise the existing retryable stream error instead.
+- Keep the sidebar's "resets in ..." countdown ticking between requests, rather than freezing until new quota data arrives.
 
-## 1.8.3
-
-### Patch Changes
-
-- [#218](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/218) [`988d87c`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/988d87c93ef0a61d4833299ef87e846c895b2f0d) Thanks [@1nk1](https://github.com/1nk1)! - Handle CR-delimited SSE events and reject oversized newline-free stream lines.
-
-## 1.8.2
+## 3.0.4
 
 ### Patch Changes
 
-- [#223](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/223) [`5200c5f`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/5200c5fdc3bec9af85299d94341577a0c54c93fa) Thanks [@briancappello](https://github.com/briancappello)! - Bump the reported Claude Code version from `2.1.87` to `2.1.258`. Anthropic gates model access on this value server-side, so newer models were rejected with a 400 `claude_code_version_too_old`: "Claude Code 2.1.87 does not support this model; version 2.1.251 or newer is required". `USER_AGENT` is now derived from `CLAUDE_CODE_VERSION` instead of repeating the version in a second literal, so future bumps only need to change one constant.
+- Actually fix the TUI sidebar failing to load from npm: 3.0.3's `tsconfig.json`-at-package-root fix didn't work either — Bun resolves `jsxImportSource` for a `tsconfig.json` relative to `process.cwd()` at import time, not relative to the imported file's directory, so it's never consulted once the host process's cwd is the user's project directory instead of the plugin's own package dir. Replace the `tsconfig.json` approach with a per-file `/** @jsxImportSource @opentui/solid */` pragma comment in `tui.tsx`, which Bun honors regardless of cwd. Verified end-to-end against a real `npm pack` tarball imported from an unrelated working directory.
+
+## 3.0.3
+
+### Patch Changes
+
+- Fix the TUI sidebar still silently failing to load from npm even after 3.0.1's `files` fix: `tui.tsx` needs `jsxImportSource: "@opentui/solid"` to transpile, which Bun reads from a `tsconfig.json` at the installed package's root (the directory containing `package.json`) — a `tsconfig.json` nested under `src/` is not picked up once `node_modules`/`package.json` establish that root. Without it, Bun defaults to the React JSX runtime and fails resolving `react/jsx-dev-runtime`, silently, with no log output. Ship the existing root `tsconfig.json` in the published package and added packaging-test coverage asserting it's present.
+
+## 3.0.2
+
+### Patch Changes
+
+- Fix npm-installed plugin loading by exporting the OpenCode package-plugin module shape (`{ id, server }`). The previous named-only export worked as a legacy file-drop plugin but was ignored for package installs, causing OpenCode to fall back to native Anthropic API-key auth.
+
+## 3.0.1
+
+### Patch Changes
+
+- Fix the TUI sidebar silently failing to load when installed from npm: the published `files` list included `src/tui.tsx` but not the sibling modules it imports at runtime (`src/quota-format.ts`, `src/quota-headers.ts`, `src/quota-state.ts`), so the import resolved nothing outside a local checkout. Added a packaging test that walks the relative-import graph from `src/tui.tsx` and asserts every reachable file is included in `npm pack`'s file list.
+
+## 2.8.1
+
+### Patch Changes
+
+- Rebased onto upstream `ex-machina-co/opencode-anthropic-auth`, picking up `CLAUDE_CODE_VERSION` `2.1.258` (supersedes the fork's own `2.1.257` bump).
+
+## 2.7.1
+
+### Patch Changes
+
+- Bump spoofed Claude Code version from 2.1.177 to 2.1.257 (verified against live 2.1.257 traffic). Anthropic's API now requires Claude Code 2.1.251+ for current models — the stale version in `user-agent` caused requests for newer models (e.g. Fable 5.1) to fail with "Claude Code X does not support this model; version Y or newer is required."
+
+## 2.7.0
+
+### Minor Changes
+
+- **Server-side safety fallback** (ported from cortexkit/anthropic-auth v1.19.0): OAuth requests for
+  `claude-fable-5`/`claude-opus-5` now opt into Anthropic's `fallbacks: "default"` server-side safety
+  fallback, so a content-filter refusal is transparently rerouted instead of returned as an error. The
+  returned `fallback` content block is hidden behind a signed `thinking` marker before being stored by
+  OpenCode, and restored on the next replay before the request is signed. Only affects the OAuth fetch
+  path — custom API-key routes are unaffected.
+
+- **Assistant prefill strip** (ported from cortexkit/anthropic-auth v1.19.0): trailing whitespace-only
+  text after the latest assistant `tool_use` is removed before replay, preventing a valid tool-result
+  continuation from being rejected as an unsupported assistant prefill.
+
+## 2.6.0
+
+### Minor Changes
+
+- add latest recommended approaches, and add inspired plugin new releases additions
+
+### Patch Changes
+
+- **Preserve thinking blocks when repairing orphaned tool_use/tool_result pairs** (inspired by
+  griffinmartin/opencode-claude-auth): after `/compact` or `/undo`, orphaned `tool_use` blocks are no
+  longer dropped from the latest assistant message — dropping them alongside a `thinking` block
+  triggered Anthropic's "thinking blocks... cannot be modified" 400. Instead, a placeholder
+  `tool_result` is synthesized to restore adjacency, and assistant message content is never rewritten.
+
+## 2.4.0
+
+### Minor Changes
+
+- **Orphaned tool_use/tool_result repair** (inspired by griffinmartin/opencode-claude-auth): requests
+  are now scanned for `tool_use` blocks with no matching `tool_result` (and vice versa) before being
+  sent upstream. Orphaned blocks are dropped, and messages left with empty content after repair are
+  removed entirely. This prevents Anthropic 400 rejections when OpenCode truncates or reconstructs
+  conversation history (e.g. after an interruption) and leaves an unpaired tool call/result behind.
+
+  **Exclude `interleaved-thinking-2025-05-14` beta for Haiku models** (inspired by
+  griffinmartin/opencode-claude-auth): Haiku models don't support interleaved thinking, so the beta
+  header is now omitted for Haiku requests to match real Claude Code CLI behavior. `mergeBetaHeaders`
+  and `setOAuthHeaders` accept an optional model id, and the fetch wrapper now reads the model from
+  the request body before setting headers so this exclusion can be applied.
+
+  **Strip unsupported `effort` parameters for Haiku models** (inspired by
+  griffinmartin/opencode-claude-auth): Anthropic rejects `output_config.effort` and `thinking.effort`
+  for Haiku models. These fields are now stripped from the request body for Haiku, removing the
+  parent object entirely if it becomes empty as a result.
+
+  **429 retry-after capped backoff** (inspired by griffinmartin/opencode-claude-auth): rate-limited
+  (`429`) responses are now retried automatically, honoring the `retry-after` response header when
+  present (capped at 30s) and falling back to capped exponential backoff otherwise, up to 3 retries.
+
+## 2.3.0
+
+### Patch Changes
+
+- **Bridge-anchor distance correctness**: `selectHybridMessageAnchors` previously
+  measured the 20-block lookback distance by summing only cacheable blocks from
+  user-role messages, silently ignoring assistant turns (text, tool_use) and thinking
+  blocks. Anthropic's lookback window counts every positional content block regardless
+  of role or type. The new `rawBlockCount` helper counts all blocks, and the bridge
+  selection loop now walks the full message array — so the bridge fires correctly in
+  tool-heavy and thinking-heavy sessions instead of too late or not at all. The
+  algorithm now also directly measures the block count between the bridge candidate
+  and `latest` (excluding the anchor's own blocks), matching the invariant described
+  in the JSDoc. The `MessageAnchorPosition` wrapper type was removed; anchor indices
+  are now plain `number | undefined`.
+- **Bridge placement tests**: tightened existing bridge test to pin the exact bridge
+  index (7); added boundary tests at 20 blocks (bridge placed) and 21 blocks (bridge
+  absent); added test confirming no bridge is placed when no valid user anchor exists
+  before the overflow point; added `latestIndex === 2` regression test (single rolling
+  candidate, no room for bridge).
+- **`tool_result` anchor regression test**: verified that a user message containing
+  only `tool_result` blocks is correctly selected as a rolling anchor.
+- **`context_management` passthrough regression test**: verified that
+  `rewriteRequestBody` preserves a client-supplied `context_management` body field
+  (e.g. `context-management-2025-06-27` server-side tool-result clearing) untouched.
+
+## 2.2.0
+
+### Minor Changes
+
+- **SSE retryable-error detection** (ported from cortexkit/anthropic-auth v1.10.0): transient
+  Anthropic server errors (`api_error`, `overloaded_error`, `server_error`, `internal_server_error`)
+  emitted as SSE events inside HTTP 200 streams are now detected and thrown as
+  `ECONNRESET`-coded errors so OpenCode can use its normal auto-retry flow instead of
+  surfacing them as non-retryable unknown failures.
+
+### Patch Changes
+
+- **System tail coalescing** (ported from cortexkit/anthropic-auth v1.10.1): when OpenCode or a
+  plugin emits system instructions split across multiple blocks, all blocks after the primary
+  system prompt block are merged into one before placing the hybrid cache anchor. Prevents the
+  same byte-identical system text from moving the `cache_control` breakpoint when the block
+  layout changes between merged and split forms, which would bust the cache every turn.
+- **Buffered tool-prefix rewriting**: the stream rewriter now holds back any suffix that starts
+  a partial `"name"` marker, ensuring `mcp_` tool names spanning two stream chunks are correctly
+  stripped even when the chunk boundary falls inside the name string.
+- **OAuth fingerprint update**: aligned `CLAUDE_CODE_VERSION` (`2.1.177`), `USER_AGENT`, and
+  `CLAUDE_CODE_ENTRYPOINT` (`cli`) with Claude Code 2.1.177 captured traffic
+  (from cortexkit/anthropic-auth v1.9.4).
+
+## 2.1.0
+
+### Minor Changes
+
+- Improved hybrid 1h prompt-caching breakpoint placement (ported from cortexkit/anthropic-auth):
+  - **Rolling latest anchor**: cache breakpoint now placed on the most recent user message beyond
+    `messages[1]`, keeping cache hot across long multi-turn sessions.
+  - **Bridge anchor**: when the cumulative block distance between the previous and latest user
+    anchors exceeds Anthropic's 20-block lookback window, an additional bridge breakpoint is
+    inserted at the previous user boundary so all anchors stay within the sliding window.
+  - **Magic-context split**: when `messages[0]` contains two or more cacheable blocks (stable
+    prefix merged with volatile delta), the first and second blocks are anchored instead of the
+    last block, preventing the volatile tail from busting the cache on every turn.
+  - **Thinking/redacted_thinking guard**: thinking and redacted_thinking blocks are excluded from
+    cache anchor placement; a message whose content is entirely thinking blocks is skipped entirely
+    (avoids Anthropic 400 `"Extra inputs are not permitted"` on `cache_control`).
+  - **Trailing assistant strip**: assistant-role messages at the tail of the request are removed
+    before caching and forwarding; OAuth endpoints reject assistant prefill.
 
 ## 1.8.1
 
