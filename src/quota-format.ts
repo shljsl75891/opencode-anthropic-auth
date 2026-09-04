@@ -14,10 +14,43 @@ export function formatRelativeTime(
   return `in ${days}d`
 }
 
-export function formatQuotaWindowLine(
+const BAR_WIDTH = 10
+const BAR_FILLED = '█'
+const BAR_EMPTY = '░'
+
+export function renderQuotaBar(
+  usedPercent: number,
+  width: number = BAR_WIDTH,
+): string {
+  const clamped = Math.min(100, Math.max(0, usedPercent))
+  const filled = Math.round((clamped / 100) * width)
+  return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(width - filled)
+}
+
+export type QuotaTone = 'ok' | 'warn' | 'err'
+
+export function quotaTone(usedPercent: number): QuotaTone {
+  if (usedPercent >= 90) return 'err'
+  if (usedPercent >= 75) return 'warn'
+  return 'ok'
+}
+
+export interface QuotaWindowParts {
+  label: string
+  bar: string
+  tone: QuotaTone
+  suffix: string
+}
+
+export function formatQuotaWindowParts(
   label: string,
   window: QuotaWindow,
   now: Date = new Date(),
-): string {
-  return `${label}: ${window.usedPercent}% used · resets ${formatRelativeTime(window.resetsAt, now)}`
+): QuotaWindowParts {
+  return {
+    label,
+    bar: renderQuotaBar(window.usedPercent),
+    tone: quotaTone(window.usedPercent),
+    suffix: `${window.usedPercent}% · resets ${formatRelativeTime(window.resetsAt, now)}`,
+  }
 }

@@ -30,7 +30,9 @@ function parseWindow(
   const reset = Number(resetRaw)
   if (!Number.isFinite(utilization) || !Number.isFinite(reset)) return undefined
 
-  const usedPercent = Math.min(100, Math.max(0, Math.round(utilization * 100)))
+  // Anthropic's own usage UI rounds up (0.081 -> 9%, not 8%) — ceiling
+  // keeps a usage meter conservative and matches what users see there.
+  const usedPercent = Math.min(100, Math.max(0, Math.ceil(utilization * 100)))
   return {
     usedPercent,
     remainingPercent: 100 - usedPercent,

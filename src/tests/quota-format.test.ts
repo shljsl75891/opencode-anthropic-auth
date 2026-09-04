@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { formatQuotaWindowLine, formatRelativeTime } from '../quota-format'
+import {
+  formatQuotaWindowParts,
+  formatRelativeTime,
+  quotaTone,
+  renderQuotaBar,
+} from '../quota-format'
 
 describe('formatRelativeTime', () => {
   const now = new Date('2026-09-04T00:00:00.000Z')
@@ -21,10 +26,47 @@ describe('formatRelativeTime', () => {
   })
 })
 
-describe('formatQuotaWindowLine', () => {
-  test('combines label, percent, and reset countdown', () => {
+describe('renderQuotaBar', () => {
+  test('renders an empty bar at 0%', () => {
+    expect(renderQuotaBar(0)).toBe('░░░░░░░░░░')
+  })
+
+  test('renders a full bar at 100%', () => {
+    expect(renderQuotaBar(100)).toBe('██████████')
+  })
+
+  test('rounds to the nearest filled segment', () => {
+    expect(renderQuotaBar(15)).toBe('██░░░░░░░░')
+    expect(renderQuotaBar(50)).toBe('█████░░░░░')
+  })
+
+  test('clamps out-of-range percentages', () => {
+    expect(renderQuotaBar(-10)).toBe('░░░░░░░░░░')
+    expect(renderQuotaBar(150)).toBe('██████████')
+  })
+})
+
+describe('quotaTone', () => {
+  test('is "ok" below 75%', () => {
+    expect(quotaTone(0)).toBe('ok')
+    expect(quotaTone(74)).toBe('ok')
+  })
+
+  test('is "warn" from 75% to 89%', () => {
+    expect(quotaTone(75)).toBe('warn')
+    expect(quotaTone(89)).toBe('warn')
+  })
+
+  test('is "err" from 90% up', () => {
+    expect(quotaTone(90)).toBe('err')
+    expect(quotaTone(100)).toBe('err')
+  })
+})
+
+describe('formatQuotaWindowParts', () => {
+  test('combines label, bar, tone, and reset suffix', () => {
     const now = new Date('2026-09-04T00:00:00.000Z')
-    const line = formatQuotaWindowLine(
+    const parts = formatQuotaWindowParts(
       '5h',
       {
         usedPercent: 42,
@@ -33,6 +75,11 @@ describe('formatQuotaWindowLine', () => {
       },
       now,
     )
-    expect(line).toBe('5h: 42% used · resets in 5h')
+    expect(parts).toEqual({
+      label: '5h',
+      bar: '████░░░░░░',
+      tone: 'ok',
+      suffix: '42% · resets in 5h',
+    })
   })
 })
