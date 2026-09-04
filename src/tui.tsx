@@ -5,16 +5,15 @@ import type {
   TuiPluginModule,
   TuiThemeCurrent,
 } from '@opencode-ai/plugin/tui'
-import { StyledText, fg as styledFg, type TextRenderable } from '@opentui/core'
 import {
-  type Accessor,
-  createEffect,
-  createSignal,
-  onCleanup,
-  Show,
-} from 'solid-js'
+  type BoxRenderable,
+  StyledText,
+  fg as styledFg,
+  type TextRenderable,
+} from '@opentui/core'
+import { onCleanup } from 'solid-js'
 import { formatQuotaWindowParts, type QuotaTone } from './quota-format.ts'
-import type { QuotaSnapshot, QuotaWindow } from './quota-headers.ts'
+import type { QuotaWindow } from './quota-headers.ts'
 import { readQuotaState } from './quota-state.ts'
 
 // Above the internal sidebar sections (mcp/todo/etc. use order 100-500) —
@@ -28,97 +27,87 @@ function toneColor(theme: TuiThemeCurrent, tone: QuotaTone) {
   return theme.success
 }
 
-function QuotaWindowRow(props: {
-  theme: TuiThemeCurrent
-  label: string
-  window: QuotaWindow
-  now: Date
-}) {
-  // The Solid reconciler stringifies the "content" JSX prop (`${value}`)
-  // instead of forwarding it, so a StyledText assigned that way renders as
-  // "[object Object]". Set node.content directly via ref instead.
-  let node: TextRenderable | undefined
-  createEffect(() => {
-    const parts = formatQuotaWindowParts(props.label, props.window, props.now)
-    const styled = new StyledText([
-      styledFg(props.theme.textMuted)(`${parts.label} `),
-      styledFg(toneColor(props.theme, parts.tone))(parts.bar),
-      styledFg(props.theme.textMuted)(` ${parts.suffix}`),
-    ])
-    if (node) node.content = styled
-  })
-  return (
-    <text
-      ref={(el) => {
-        node = el
-      }}
-    />
-  )
-}
-
+// This plugin loads from node_modules, which OpenCode's Solid JSX transform
+// deliberately skips (see opencode#33884). Without that transform, JSX props
+// are evaluated once instead of compiled into reactive getters, so anything
+// built with createSignal/createEffect/Show only ever renders its first
+// value. Updates are driven imperatively instead: refs are captured once,
+// then a timer writes straight to node.content/node.visible.
 function QuotaSidebar(props: { api: TuiPluginApi }) {
-  const [snapshot, setSnapshot] = createSignal<QuotaSnapshot | undefined>(
-    readQuotaState(),
-  )
-  // Quota data only changes when a request completes, but the "resets in …"
-  // countdown has to keep ticking between requests.
-  const [now, setNow] = createSignal(new Date())
-  const theme = () => props.api.theme.current
+  let box: BoxRenderable | undefined
+  let fiveHourRow: TextRenderable | undefined
+  let sevenDayRow: TextRenderable | undefined
 
-  function refresh() {
-    const next = readQuotaState()
-    if (next?.checkedAt !== snapshot()?.checkedAt) setSnapshot(next)
+  const element = (
+    <box
+      ref={(el) => {
+        box = el
+      }}
+      flexDirection='column'
+      gap={1}
+      visible={false}
+    >
+      <text fg={props.api.theme.current.text}>
+        <b>Claude quota</b>
+      </text>
+      <text
+        ref={(el) => {
+          fiveHourRow = el
+        }}
+      />
+      <text
+        ref={(el) => {
+          sevenDayRow = el
+        }}
+      />
+    </box>
+  )
+
+  function paintRow(
+    node: TextRenderable | undefined,
+    label: string,
+    window: QuotaWindow | undefined,
+    now: Date,
+  ) {
+    if (!node) return
+    if (!window) {
+      node.visible = false
+      return
+    }
+    const theme = props.api.theme.current
+    const parts = formatQuotaWindowParts(label, window, now)
+    node.content = new StyledText([
+      styledFg(theme.textMuted)(`${parts.label} `),
+      styledFg(toneColor(theme, parts.tone))(parts.bar),
+      styledFg(theme.textMuted)(` ${parts.suffix}`),
+    ])
+    node.visible = true
   }
 
-  createEffect(() => {
-    const timer = setInterval(() => {
-      refresh()
-      setNow(new Date())
-    }, POLL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  function paint() {
+    const snapshot = readQuotaState()
+    if (!box) return
+    if (!snapshot) {
+      box.visible = false
+      return
+    }
+    box.visible = true
+    const now = new Date()
+    paintRow(fiveHourRow, '5h', snapshot.fiveHour, now)
+    paintRow(sevenDayRow, '7d', snapshot.sevenDay, now)
+  }
 
-  const offMessage = props.api.event.on('message.updated', refresh)
-  const offSession = props.api.event.on('session.updated', refresh)
+  paint()
+  const timer = setInterval(paint, POLL_MS)
+  const offMessage = props.api.event.on('message.updated', paint)
+  const offSession = props.api.event.on('session.updated', paint)
   onCleanup(() => {
+    clearInterval(timer)
     offMessage()
     offSession()
   })
 
-  return (
-    <Show when={snapshot()}>
-      {(quota: Accessor<QuotaSnapshot>) => (
-        <box flexDirection='column' gap={1}>
-          <text fg={theme().text}>
-            <b>Claude quota</b>
-          </text>
-          <Show when={quota().fiveHour}>
-            {(window: Accessor<QuotaWindow>) => (
-              <QuotaWindowRow
-                theme={theme()}
-                label='5h'
-                window={window()}
-                now={now()}
-              />
-            )}
-          </Show>
-          <Show when={quota().sevenDay}>
-            {(window: Accessor<QuotaWindow>) => (
-              <QuotaWindowRow
-                theme={theme()}
-                label='7d'
-                window={window()}
-                now={now()}
-              />
-            )}
-          </Show>
-          <Show when={quota().fallbackAdvised}>
-            <text fg={theme().warning}>fallback advised</text>
-          </Show>
-        </box>
-      )}
-    </Show>
-  )
+  return element
 }
 
 const tui: TuiPlugin = async (api) => {

@@ -34,9 +34,7 @@ function parseWindow(
   const resetsAt = new Date(reset * 1000)
   if (Number.isNaN(resetsAt.getTime())) return undefined
 
-  // Anthropic's own usage UI rounds up (0.081 -> 9%, not 8%) — ceiling
-  // keeps a usage meter conservative and matches what users see there.
-  const usedPercent = Math.min(100, Math.max(0, Math.ceil(utilization * 100)))
+  const usedPercent = Math.min(100, Math.max(0, Math.round(utilization * 100)))
   return {
     usedPercent,
     remainingPercent: 100 - usedPercent,

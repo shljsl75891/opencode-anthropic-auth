@@ -64,7 +64,7 @@ describe('parseQuotaHeaders', () => {
     expect(snapshot?.fiveHour?.remainingPercent).toBe(0)
   })
 
-  test('rounds up on any fractional utilization, matching Anthropic\u2019s usage UI', () => {
+  test('rounds to the nearest percent', () => {
     const snapshot = parseQuotaHeaders(
       headers({
         'anthropic-ratelimit-unified-7d-utilization': '0.081',
@@ -72,8 +72,7 @@ describe('parseQuotaHeaders', () => {
       }),
     )
 
-    // Math.round(8.1) would give 8; the observed UI shows 9 here.
-    expect(snapshot?.sevenDay?.usedPercent).toBe(9)
+    expect(snapshot?.sevenDay?.usedPercent).toBe(8)
   })
 
   test('keeps exact zero utilization at 0%', () => {
