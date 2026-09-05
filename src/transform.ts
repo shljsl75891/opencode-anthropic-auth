@@ -143,15 +143,22 @@ export function extractModelId(body: string): string | undefined {
 /**
  * Add TOOL_PREFIX to tool names in the request body.
  * Prefixes both tool definitions and tool_use blocks in messages.
+ *
+ * Tool definitions are also sorted by name: a change anywhere in `tools[]`
+ * invalidates the entire cached prefix, and MCP servers that attach late
+ * would otherwise shuffle the order between turns.
  */
 export function prefixToolNames(parsed: Record<string, unknown>): string {
   if (parsed.tools && Array.isArray(parsed.tools)) {
-    parsed.tools = parsed.tools.map(
-      (tool: { name?: string; [k: string]: unknown }) => ({
+    parsed.tools = parsed.tools
+      .map((tool: { name?: string; [k: string]: unknown }) => ({
         ...tool,
         name: tool.name ? prefixName(tool.name) : tool.name,
-      }),
-    )
+      }))
+      .sort((a, b) => {
+        const [x, y] = [a.name ?? '', b.name ?? '']
+        return x < y ? -1 : x > y ? 1 : 0
+      })
   }
 
   if (parsed.messages && Array.isArray(parsed.messages)) {
@@ -409,27 +416,38 @@ type HybridMessageAnchors = {
 }
 
 /**
- * Total positional block count for a message regardless of role or type.
- * Anthropic's cache lookback window counts every content block (text,
- * thinking, tool_use, tool_result, …), so distance math must use raw counts,
- * not the cacheable-only filter used to validate anchor placement.
+ * Positional block count for a message as Anthropic's cache lookback window
+ * sees it: every content block counts (text, thinking, …) regardless of
+ * cacheability, except that a run of consecutive tool_use blocks — or of
+ * consecutive tool_result blocks — occupies a single position. Parallel tool
+ * calls therefore don't push earlier breakpoints out of the window.
  */
 function rawBlockCount(message: unknown): number {
   if (!isRecord(message)) return 0
   const { content } = message
-  if (Array.isArray(content)) return content.length
   if (typeof content === 'string') return 1
-  return 0
+  if (!Array.isArray(content)) return 0
+  let count = 0
+  let prev: unknown
+  for (const block of content) {
+    const type = isRecord(block) ? block.type : undefined
+    const inRun =
+      (type === 'tool_use' || type === 'tool_result') && type === prev
+    if (!inRun) count++
+    prev = type
+  }
+  return count
 }
 
 /**
  * Collect user-role anchor indices that hold at least one cacheable block,
- * then pick the `latest` (index > 1) and a `bridge`. The bridge is the
- * furthest-back valid user anchor where the block count between it and
- * `latest` — counting ALL content blocks across user and assistant turns,
- * excluding the anchor's own blocks — does not exceed
- * ANTHROPIC_CACHE_LOOKBACK_BLOCKS. This keeps the older breakpoint inside
- * Anthropic's sliding lookback window so the cached prefix stays reachable.
+ * then pick the `latest` (index > 1) and a `bridge`. Anthropic's lookback
+ * counts the breakpoint itself as the first position, so the bridge is the
+ * furthest-back valid user anchor where `latest`'s own block count, plus
+ * every block strictly between the two anchors, plus the bridge's own
+ * anchor block, together stay within ANTHROPIC_CACHE_LOOKBACK_BLOCKS. This
+ * keeps the older breakpoint inside Anthropic's sliding lookback window so
+ * the cached prefix stays reachable.
  */
 function selectHybridMessageAnchors(messages: unknown[]): HybridMessageAnchors {
   // Collect indices of user messages beyond index 1 that have ≥1 cacheable block.
@@ -454,11 +472,17 @@ function selectHybridMessageAnchors(messages: unknown[]): HybridMessageAnchors {
   const latestIndex = rollingIndices[rollingIndices.length - 1]!
   const rollingSet = new Set(rollingIndices)
 
+  // Positions consumed by `latest`'s own anchor block plus its preceding
+  // blocks, and by the candidate's own anchor block, are fixed per call —
+  // computed once rather than folded into the running total below.
+  const fixedPositions = rawBlockCount(messages[latestIndex]) + 1
+
   let bridge: number | undefined
   let cumulativeBlocks = 0
   for (let i = latestIndex - 1; i >= 0; i--) {
     if (rollingSet.has(i)) {
-      if (cumulativeBlocks > ANTHROPIC_CACHE_LOOKBACK_BLOCKS) break
+      if (cumulativeBlocks + fixedPositions > ANTHROPIC_CACHE_LOOKBACK_BLOCKS)
+        break
       bridge = i
     }
     cumulativeBlocks += rawBlockCount(messages[i])

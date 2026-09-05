@@ -194,6 +194,22 @@ describe('prefixToolNames', () => {
     expect(result.tools[1].name).toBe('mcp_Write_file')
   })
 
+  test('sorts tools by name so late-attached MCP tools cannot reorder the cached prefix', () => {
+    const body = {
+      tools: [
+        { name: 'write_file', type: 'function' },
+        { name: 'bash', type: 'function' },
+        { name: 'read_file', type: 'function' },
+      ],
+    }
+    const result = JSON.parse(prefixToolNames(body))
+    expect(result.tools.map((t: { name: string }) => t.name)).toEqual([
+      'mcp_Bash',
+      'mcp_Read_file',
+      'mcp_Write_file',
+    ])
+  })
+
   test('prefixes tool_use block names in messages', () => {
     const body = {
       messages: [
@@ -1423,16 +1439,102 @@ describe('hybrid cache – breakpoint placement', () => {
     expect(midContent.some((b) => b.cache_control != null)).toBe(false)
   })
 
+  test('parallel tool_use run counts as one lookback position, so bridge reaches past it', () => {
+    // Same shape as the overflow test above, but the 25 blocks are a single
+    // run of consecutive tool_use. Anthropic counts that run as ONE position,
+    // so 'mid' stays inside the 20-block window and receives the bridge anchor.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'mid'),
+      makeMsg(
+        'assistant',
+        Array.from({ length: 25 }, (_, i) => ({
+          type: 'tool_use',
+          id: `t${i}`,
+          name: 'bash',
+          input: {},
+        })),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const midContent = result.messages[2].content
+    expect(midContent[midContent.length - 1].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('parallel tool_result run counts as one lookback position', () => {
+    // 25 tool_results in one user turn is a single position; a text block
+    // between two tool_use blocks breaks the run, so those count separately.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'mid'),
+      makeMsg('assistant', [
+        { type: 'tool_use', id: 'a', name: 'bash', input: {} },
+        textBlock('between'),
+        { type: 'tool_use', id: 'b', name: 'bash', input: {} },
+      ]),
+      makeMsg(
+        'user',
+        Array.from({ length: 25 }, (_, i) => ({
+          type: 'tool_result',
+          tool_use_id: `t${i}`,
+          content: 'ok',
+        })),
+      ),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const midContent = result.messages[2].content
+    expect(midContent[midContent.length - 1].cache_control).toEqual(CACHE_1H)
+  })
+
+  test('tool_use interrupted by text does not collapse across the interruption', () => {
+    // between = 16 filler text + [tool_use, text, tool_use] = 19 blocks.
+    // Total positions = latest(1) + between(19) + bridge candidate's own
+    // anchor(1) = 21, one past threshold, so bridge must NOT be placed. An
+    // implementation that treats the second tool_use as continuing the first
+    // run (ignoring the intervening text) would undercount to 18 between-
+    // blocks, land at 20, and incorrectly place the bridge.
+    const messages = [
+      makeMsg('user', 'm0'),
+      makeMsg('user', 'm1'),
+      makeMsg('user', 'bridge-candidate'),
+      makeMsg('assistant', [
+        ...Array.from({ length: 16 }, (_, i) => textBlock(`f${i}`)),
+        { type: 'tool_use', id: 'a', name: 'bash', input: {} },
+        textBlock('between'),
+        { type: 'tool_use', id: 'b', name: 'bash', input: {} },
+      ]),
+      makeMsg('user', 'latest'),
+    ]
+    const result = JSON.parse(rewriteRequestBody(cacheBody({ messages })))
+
+    const msg1 = result.messages[1]
+    expect(msg1.content[msg1.content.length - 1].cache_control).toEqual(
+      CACHE_1H,
+    )
+
+    const bridgeContent = result.messages[2].content as Array<
+      Record<string, unknown>
+    >
+    expect(bridgeContent.some((b) => b.cache_control != null)).toBe(false)
+  })
+
   test('bridge placed when block distance equals lookback threshold', () => {
-    // Exactly 20 blocks between bridge candidate (index 2) and latest (index 4).
-    // cumBlocks at anchor check = 20, which is not > 20, so bridge IS placed.
+    // Total positions = latest's own block (1) + 18 blocks between + the
+    // bridge candidate's own anchor block (1) = 20, exactly at threshold,
+    // so bridge IS placed.
     const messages = [
       makeMsg('user', 'm0'),
       makeMsg('user', 'm1'),
       makeMsg('user', 'bridge-candidate'),
       makeMsg(
         'assistant',
-        Array.from({ length: 20 }, (_, i) => textBlock(`a${i}`)),
+        Array.from({ length: 18 }, (_, i) => textBlock(`a${i}`)),
       ),
       makeMsg('user', 'latest'),
     ]
@@ -1447,15 +1549,16 @@ describe('hybrid cache – breakpoint placement', () => {
   })
 
   test('bridge not placed when block distance exceeds lookback threshold by one', () => {
-    // 21 blocks between bridge candidate (index 2) and latest (index 4).
-    // cumBlocks at anchor check = 21 > 20 → bridge=undefined.
+    // Total positions = latest's own block (1) + 19 blocks between + the
+    // bridge candidate's own anchor block (1) = 21, one past threshold,
+    // so bridge=undefined.
     const messages = [
       makeMsg('user', 'm0'),
       makeMsg('user', 'm1'),
       makeMsg('user', 'bridge-candidate'),
       makeMsg(
         'assistant',
-        Array.from({ length: 21 }, (_, i) => textBlock(`a${i}`)),
+        Array.from({ length: 19 }, (_, i) => textBlock(`a${i}`)),
       ),
       makeMsg('user', 'latest'),
     ]

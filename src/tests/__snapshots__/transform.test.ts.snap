@@ -307,11 +307,11 @@ Run \`bun run build\` to compile."
       "type": "function",
     },
     {
-      "name": "mcp_Read",
+      "name": "mcp_Edit",
       "type": "function",
     },
     {
-      "name": "mcp_Edit",
+      "name": "mcp_Read",
       "type": "function",
     },
   ],
