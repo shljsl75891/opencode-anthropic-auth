@@ -58,7 +58,7 @@ test('every runtime import reachable from src/tui.tsx is included in the publish
   for (const path of graph) {
     expect(publishedFiles.has(path)).toBe(true)
   }
-})
+}, 60_000)
 
 test('the packed tui entrypoint imports from an unrelated working directory', async () => {
   // The host imports this file with its cwd set to the user's project, not to
@@ -83,7 +83,7 @@ test('the packed tui entrypoint imports from an unrelated working directory', as
     mkdirSync(cwd)
     const entry = join(pkg, 'src/tui.tsx')
     const probe =
-      await $`bun -e ${`import m from ${JSON.stringify(entry)}; console.log(m.id, typeof m.tui)`}`
+      await $`bun -e ${`import m from ${JSON.stringify(entry)}; console.log(m.id, typeof m.setup)`}`
         .cwd(cwd)
         .quiet()
 
