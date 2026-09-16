@@ -1025,6 +1025,31 @@ describe('hybrid cache – breakpoint placement', () => {
     }
   })
 
+  test('strips a pre-existing cache_control from tools', () => {
+    // Anthropic processes cache_control in tools -> system -> messages
+    // order and rejects a 1h block coming after a 5m one. A stray 5m
+    // breakpoint the host places on tools must not survive into a request
+    // that also carries our own 1h system/message anchors.
+    const raw = JSON.stringify({
+      tools: [
+        { name: 'bash' },
+        {
+          name: 'edit',
+          cache_control: { type: 'ephemeral', ttl: '5m' },
+        },
+      ],
+      system: [{ type: 'text', text: 'block' }],
+      messages: [makeMsg('user', 'hi')],
+    })
+    const result = JSON.parse(rewriteRequestBody(raw))
+
+    expect(
+      result.tools.some((tool: { cache_control?: unknown }) =>
+        Object.hasOwn(tool, 'cache_control'),
+      ),
+    ).toBe(false)
+  })
+
   test('anchors last system block (after identity) with 1h cache', () => {
     const result = JSON.parse(
       rewriteRequestBody(

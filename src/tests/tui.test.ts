@@ -9,12 +9,6 @@ import {
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type {
-  TuiPluginApi,
-  TuiPluginMeta,
-  TuiSlotContext,
-  TuiSlotPlugin,
-} from '@opencode-ai/plugin/tui'
 import { RGBA } from '@opentui/core'
 import { testRender } from '@opentui/solid'
 import type { QuotaSnapshot } from '../quota-headers.ts'
@@ -22,9 +16,8 @@ import { writeQuotaState } from '../quota-state.ts'
 import plugin from '../tui.tsx'
 
 describe('tui plugin module', () => {
-  test('exports a tui entrypoint function and no server hooks', () => {
-    expect(plugin.tui).toBeFunction()
-    expect(plugin.server).toBeUndefined()
+  test('exports a setup function', () => {
+    expect(plugin.setup).toBeFunction()
   })
 
   test('exports a non-empty id for path-referenced plugin loading', () => {
@@ -34,6 +27,7 @@ describe('tui plugin module', () => {
 })
 
 const color = RGBA.fromHex('#ffffff')
+const feedback = { default: color, subdued: color }
 
 function snapshot(usedPercent: number, checkedAt: string): QuotaSnapshot {
   return {
@@ -53,48 +47,48 @@ function snapshot(usedPercent: number, checkedAt: string): QuotaSnapshot {
   }
 }
 
-function fakeApi() {
+function fakeContext() {
   const handlers = new Map<string, () => void>()
-  let registered: TuiSlotPlugin | undefined
-  const api = {
+  let claim: { render: (input: { sessionID: string }) => unknown } | undefined
+  const context = {
     theme: {
-      current: {
-        text: color,
-        textMuted: color,
-        success: color,
-        warning: color,
-        error: color,
+      text: {
+        default: color,
+        subdued: color,
+        feedback: { error: feedback, warning: feedback, success: feedback },
       },
     },
-    event: {
+    data: {
       on(type: string, handler: () => void) {
         handlers.set(type, handler)
         return () => handlers.delete(type)
       },
     },
-    slots: {
-      register(reg: TuiSlotPlugin) {
-        registered = reg
-        return 'quota'
+    ui: {
+      slot(input: {
+        render: (input: { sessionID: string }) => unknown
+        append: string
+      }) {
+        claim = input
+        return () => {
+          claim = undefined
+        }
       },
     },
-  } as unknown as TuiPluginApi
+  } as unknown as import('@opencode/plugin/tui/context').Context
   return {
-    api,
+    context,
     emit(type: string) {
       const handler = handlers.get(type)
       expect(handler).toBeDefined()
       handler?.()
     },
     sidebar() {
-      expect(registered?.slots.sidebar_content).toBeDefined()
-      const ctx: TuiSlotContext = { theme: api.theme }
-      return registered?.slots.sidebar_content?.(ctx, { session_id: 'session' })
+      expect(claim).toBeDefined()
+      return claim?.render({ sessionID: 'session' })
     },
   }
 }
-
-const fakeMeta = {} as TuiPluginMeta
 
 // The host compiles npm-installed plugins with Bun's native JSX (no Solid
 // babel transform), so these tests must run tui.tsx the same way: no preload.
@@ -118,8 +112,8 @@ describe('quota sidebar', () => {
 
   test('re-renders usage and countdown when a request updates the quota file', async () => {
     writeQuotaState(snapshot(4, '2026-09-04T00:00:00.000Z'))
-    const { api, emit, sidebar } = fakeApi()
-    await plugin.tui(api, undefined, fakeMeta)
+    const { context, emit, sidebar } = fakeContext()
+    plugin.setup(context)
 
     const { renderer, renderOnce, captureCharFrame } = await testRender(
       () => sidebar(),
@@ -133,7 +127,7 @@ describe('quota sidebar', () => {
 
       writeQuotaState(snapshot(42, '2026-09-04T03:00:00.000Z'))
       setSystemTime(new Date('2026-09-04T03:00:00.000Z'))
-      emit('message.updated')
+      emit('session.usage.updated')
       await renderOnce()
       expect(captureCharFrame()).toContain('42% · resets in 2h')
       expect(captureCharFrame()).not.toContain('4% · resets in 5h')
@@ -143,8 +137,8 @@ describe('quota sidebar', () => {
   })
 
   test('renders nothing until a quota snapshot exists', async () => {
-    const { api, sidebar } = fakeApi()
-    await plugin.tui(api, undefined, fakeMeta)
+    const { context, sidebar } = fakeContext()
+    plugin.setup(context)
 
     const { renderer, renderOnce, captureCharFrame } = await testRender(
       () => sidebar(),

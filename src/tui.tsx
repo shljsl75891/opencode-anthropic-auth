@@ -1,10 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import type {
-  TuiPlugin,
-  TuiPluginApi,
-  TuiPluginModule,
-  TuiThemeCurrent,
-} from '@opencode-ai/plugin/tui'
+import { Plugin } from '@opencode/plugin/tui'
+import type { Context } from '@opencode/plugin/tui/context'
 import {
   type BoxRenderable,
   StyledText,
@@ -16,15 +12,12 @@ import { formatQuotaWindowParts, type QuotaTone } from './quota-format.ts'
 import type { QuotaWindow } from './quota-headers.ts'
 import { readQuotaState } from './quota-state.ts'
 
-// Above the internal sidebar sections (mcp/todo/etc. use order 100-500) —
-// quota is meant to stay in peripheral vision at all times.
-const SIDEBAR_ORDER = 50
 const POLL_MS = 5_000
 
-function toneColor(theme: TuiThemeCurrent, tone: QuotaTone) {
-  if (tone === 'err') return theme.error
-  if (tone === 'warn') return theme.warning
-  return theme.success
+function toneColor(theme: Context['theme'], tone: QuotaTone) {
+  if (tone === 'err') return theme.text.feedback.error.default
+  if (tone === 'warn') return theme.text.feedback.warning.default
+  return theme.text.feedback.success.default
 }
 
 // This plugin loads from node_modules, which OpenCode's Solid JSX transform
@@ -33,7 +26,7 @@ function toneColor(theme: TuiThemeCurrent, tone: QuotaTone) {
 // built with createSignal/createEffect/Show only ever renders its first
 // value. Updates are driven imperatively instead: refs are captured once,
 // then a timer writes straight to node.content/node.visible.
-function QuotaSidebar(props: { api: TuiPluginApi }) {
+function QuotaSidebar(props: { context: Context }) {
   let box: BoxRenderable | undefined
   let fiveHourRow: TextRenderable | undefined
   let sevenDayRow: TextRenderable | undefined
@@ -47,7 +40,7 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       gap={1}
       visible={false}
     >
-      <text fg={props.api.theme.current.text}>
+      <text fg={props.context.theme.text.default}>
         <b>Claude quota</b>
       </text>
       <text
@@ -74,12 +67,12 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       node.visible = false
       return
     }
-    const theme = props.api.theme.current
+    const theme = props.context.theme
     const parts = formatQuotaWindowParts(label, window, now)
     node.content = new StyledText([
-      styledFg(theme.textMuted)(`${parts.label} `),
+      styledFg(theme.text.subdued)(`${parts.label} `),
       styledFg(toneColor(theme, parts.tone))(parts.bar),
-      styledFg(theme.textMuted)(` ${parts.suffix}`),
+      styledFg(theme.text.subdued)(` ${parts.suffix}`),
     ])
     node.visible = true
   }
@@ -99,32 +92,23 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
 
   paint()
   const timer = setInterval(paint, POLL_MS)
-  const offMessage = props.api.event.on('message.updated', paint)
-  const offSession = props.api.event.on('session.updated', paint)
+  const offUsage = props.context.data.on('session.usage.updated', paint)
+  const offStatus = props.context.data.on('session.status', paint)
   onCleanup(() => {
     clearInterval(timer)
-    offMessage()
-    offSession()
+    offUsage()
+    offStatus()
   })
 
   return element
 }
 
-const tui: TuiPlugin = async (api) => {
-  api.slots.register({
-    order: SIDEBAR_ORDER,
-    slots: {
-      sidebar_content() {
-        return <QuotaSidebar api={api} />
-      },
-    },
-  })
-}
-
-// Path-referenced plugins (config `plugin: ["/abs/path"]`) require an
-// exported id; the host throws "Path plugin must export id" without it.
-const plugin: TuiPluginModule & { id: string } = {
+export default Plugin.define({
   id: '@sahiljassal/opencode-anthropic-auth',
-  tui,
-}
-export default plugin
+  setup(context) {
+    return context.ui.slot({
+      append: 'sidebar.content',
+      render: () => <QuotaSidebar context={context} />,
+    })
+  },
+})

@@ -330,6 +330,14 @@ function removeCacheControl(value: unknown): void {
 }
 
 function removeAllCacheControls(parsed: Record<string, unknown>): void {
+  // Anthropic processes cache_control blocks in the order tools, system,
+  // messages, and rejects a ttl=1h block that comes after a ttl=5m one. A
+  // stray 5m breakpoint the host places on `tools` (untouched by our own
+  // system/messages anchors below) would outrank every 1h anchor we set, so
+  // it must be stripped here too rather than just system/messages.
+  if (Array.isArray(parsed.tools)) {
+    for (const tool of parsed.tools) removeCacheControl(tool)
+  }
   if (Array.isArray(parsed.system)) {
     for (const block of parsed.system) removeCacheControl(block)
   }

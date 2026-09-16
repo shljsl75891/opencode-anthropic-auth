@@ -9,21 +9,22 @@ Fork of [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
+Requires OpenCode v2.
+
 ## Install
 
 Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugin": ["@sahiljassal/opencode-anthropic-auth"]
+  "plugins": ["@sahiljassal/opencode-anthropic-auth"]
 }
 ```
 
 ## Authentication Methods
 
 - **Claude Pro/Max** — OAuth flow via `claude.ai`. Uses your existing subscription at no additional API cost.
-- **Create an API Key** — OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
-- **Manually enter API Key** — Standard API key entry.
+- **Manually enter API Key** — Standard API key entry, handled by OpenCode's built-in Anthropic integration (also honors `ANTHROPIC_API_KEY`).
 
 ## Prompt Caching
 
@@ -52,7 +53,7 @@ Additional behaviours:
 | Variable             | Description                                                                              |
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | `ANTHROPIC_BASE_URL` | Override API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.              |
-| `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification. Only effective with `ANTHROPIC_BASE_URL`. |
+| `ANTHROPIC_INSECURE` | Not supported on OpenCode v2 — request hooks can rewrite a request but can't disable TLS verification. Setting it logs a warning and has no effect. |
 
 ## License
 

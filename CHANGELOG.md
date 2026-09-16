@@ -1,6 +1,18 @@
 # @ex-machina/opencode-anthropic-auth
 
-## 3.0.7
+## 4.0.0
+
+### Major Changes
+
+- Port the plugin to the OpenCode v2 plugin API. OpenCode v2 removed the v1 `auth` hook and provider `fetch` override this plugin relied on, so this is a breaking change — **this release requires OpenCode v2 and is no longer loadable by OpenCode v1** (pin to a `3.x` release if you're still on OpenCode v1).
+
+  - The package now exports a v2 `Plugin.define({ id, setup })` default export instead of the v1 named `AnthropicAuthPlugin` function.
+  - Claude Pro/Max OAuth is now registered through `ctx.integration.transform`, with token refresh wired into OpenCode v2's integration refresh lifecycle (still with a plugin-level single-flight guard against concurrent refreshes racing a rotating refresh token).
+  - Anthropic request/response rewriting (OAuth headers, beta flags, body/tool-name transforms, hybrid prompt caching, server-side fallback, `ANTHROPIC_BASE_URL`) now runs through `ctx.session.hook('http.request' | 'http.response', ...)`, gated to native Anthropic requests using this plugin's OAuth connection.
+  - The "Create an API Key" console OAuth method (which minted and stored an Anthropic API key) is dropped — OpenCode v2's plugin API doesn't support an OAuth flow that ends in a stored API key. Manual API key entry and `ANTHROPIC_API_KEY` continue to work via OpenCode's built-in Anthropic integration.
+  - Anthropic models billed through this plugin's OAuth connection go back to showing no API price, restored via `ctx.model.transform` (OpenCode v2's registrations are disposable, unlike the v2 prerelease API this was previously blocked on).
+  - `ANTHROPIC_INSECURE` is not supported under OpenCode v2: request hooks can rewrite a `Request` but can't disable TLS verification for it. The plugin now logs a warning instead of silently leaving it unapplied.
+  - The quota sidebar (`./tui` export) is rewritten against OpenCode v2's TUI plugin API (`ui.slot`, `data.on`, the restructured `theme.text.*` tokens).
 
 ### Patch Changes
 
