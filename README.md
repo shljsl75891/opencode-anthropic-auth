@@ -15,9 +15,11 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugin": ["@sahiljassal/opencode-anthropic-auth"]
+  "plugin": ["@sahiljassal/opencode-anthropic-auth@v1"]
 }
 ```
+
+This is the OpenCode v1 release line (3.x), published under the `v1` npm tag. The `latest` tag (4.x) needs OpenCode v2.
 
 ## Authentication Methods
 

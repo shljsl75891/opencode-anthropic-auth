@@ -61,5 +61,8 @@
     "lefthook": "2.1.9",
     "turbo": "2.9.18",
     "typescript": "6.0.3"
+  },
+  "publishConfig": {
+    "tag": "v1"
   }
 }
