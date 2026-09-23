@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - v1-maintenance
 
 concurrency:
   group: publish
