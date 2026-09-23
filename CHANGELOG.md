@@ -1,5 +1,11 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 3.0.8
+
+### Patch Changes
+
+- [`4948dc6`](https://github.com/shljsl75891/opencode-anthropic-auth/commit/4948dc623eb0211c842f0def38f99942470e2a85) Thanks [@shljsl75891](https://github.com/shljsl75891)! - Bump reported Claude Code version to 2.1.280. Opus 5.5 requests failed with `claude_code_version_too_old` because the reported version (2.1.258) was too old.
+
 ## 3.0.7
 
 ### Patch Changes
