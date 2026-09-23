@@ -40,7 +40,7 @@
     "format:check": "biome format .",
     "lint": "biome lint --error-on-warnings .",
     "change": "changeset",
-    "release": "bun run build && bun change publish"
+    "release": "bun run build && bun change publish --tag v1"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
